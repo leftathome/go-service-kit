@@ -1,7 +1,0 @@
-{
-  "database": "dolt",
-  "backend": "dolt",
-  "dolt_mode": "embedded",
-  "dolt_database": "gsk",
-  "project_id": "26bff91b-e030-4c77-ae2d-f1c0dfcd8644"
-}

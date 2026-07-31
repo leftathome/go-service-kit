@@ -3,3 +3,9 @@
 .dolt/
 *.db
 .beads-credential-key
+
+# Beads tracker: gitignored entirely (matches nagus and go-service-template).
+.beads/
+
+# Navigator: .agent/ knowledge is committed; per-developer session state is not.
+.agent/.nav-*
