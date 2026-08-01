@@ -1,0 +1,154 @@
+components:
+  schemas:
+    ErrorDetail:
+      additionalProperties: false
+      properties:
+        location:
+          description: Where the error occurred, e.g. 'body.items[3].tags' or 'path.thing-id'
+          type: string
+        message:
+          description: Error message text
+          type: string
+        value:
+          description: The value at the given location
+      type: object
+    ErrorModel:
+      additionalProperties: false
+      properties:
+        detail:
+          description: A human-readable explanation specific to this occurrence of the problem.
+          examples:
+            - Property foo is required but is missing.
+          type: string
+        errors:
+          description: Optional list of individual error details
+          items:
+            $ref: "#/components/schemas/ErrorDetail"
+          type:
+            - array
+            - "null"
+        instance:
+          description: A URI reference that identifies the specific occurrence of the problem.
+          examples:
+            - https://example.com/error-log/abc123
+          format: uri
+          type: string
+        status:
+          description: HTTP status code
+          examples:
+            - 400
+          format: int64
+          type: integer
+        title:
+          description: A short, human-readable summary of the problem type. This value should not change between occurrences of the error.
+          examples:
+            - Bad Request
+          type: string
+        type:
+          default: about:blank
+          description: A URI reference to human-readable documentation for the error.
+          examples:
+            - https://example.com/errors/example
+          format: uri
+          type: string
+      type: object
+    FixtureWidget:
+      additionalProperties: false
+      properties:
+        id:
+          description: Opaque widget identifier
+          type: string
+        name:
+          description: Human-readable label
+          type: string
+      required:
+        - id
+        - name
+      type: object
+    PageFixtureWidget:
+      additionalProperties: false
+      properties:
+        has_more:
+          description: Whether a further page exists. Equivalent to next_cursor being present.
+          type: boolean
+        items:
+          description: The page of results, in a stable order. Never null.
+          items:
+            $ref: "#/components/schemas/FixtureWidget"
+          type: array
+        next_cursor:
+          description: Opaque cursor for the next page. Absent on the last page. Do not parse it.
+          type: string
+      required:
+        - items
+        - has_more
+      type: object
+info:
+  description: Fixture surface used by the kit's own golden test.
+  title: Fixture API
+  version: 1.2.3
+openapi: 3.1.0
+paths:
+  /widgets:
+    get:
+      operationId: list-widgets
+      parameters:
+        - description: Opaque cursor from a previous response's next_cursor. Omit for the first page.
+          explode: false
+          in: query
+          name: cursor
+          schema:
+            description: Opaque cursor from a previous response's next_cursor. Omit for the first page.
+            maxLength: 1024
+            type: string
+        - description: Maximum items to return.
+          explode: false
+          in: query
+          name: limit
+          schema:
+            default: 50
+            description: Maximum items to return.
+            format: int64
+            maximum: 200
+            minimum: 1
+            type: integer
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PageFixtureWidget"
+          description: OK
+        default:
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ErrorModel"
+          description: Error
+      summary: List widgets
+  /widgets/{id}:
+    get:
+      operationId: get-widget
+      parameters:
+        - description: Widget identifier
+          in: path
+          name: id
+          required: true
+          schema:
+            description: Widget identifier
+            maxLength: 64
+            type: string
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/FixtureWidget"
+          description: OK
+        default:
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ErrorModel"
+          description: Error
+      summary: Get one widget
