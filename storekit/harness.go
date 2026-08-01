@@ -263,7 +263,7 @@ func (h Harness[T, K]) testPutOverwrites(t *testing.T) {
 		t.Fatalf("Get after overwrite returned %#v, want the second value %#v", got, second)
 	}
 
-	all := h.sweep(t, ctx, s)
+	all := h.sweep(ctx, t, s)
 	if len(all) != 1 {
 		t.Fatalf("overwrite must not duplicate: List returned %d items, want 1", len(all))
 	}
@@ -289,7 +289,7 @@ func (h Harness[T, K]) testDelete(t *testing.T) {
 	if _, found, err := s.Get(ctx, h.KeyOf(other)); err != nil || !found {
 		t.Fatalf("Delete removed an unrelated key: found=%v err=%v, want true/nil", found, err)
 	}
-	if all := h.sweep(t, ctx, s); len(all) != 1 {
+	if all := h.sweep(ctx, t, s); len(all) != 1 {
 		t.Fatalf("after deleting 1 of 2, List returned %d items, want 1", len(all))
 	}
 }
@@ -338,10 +338,10 @@ func (h Harness[T, K]) testListEmpty(t *testing.T) {
 func (h Harness[T, K]) testListStableOrder(t *testing.T) {
 	ctx := t.Context()
 	s := h.NewStore(t)
-	seeded := h.seed(t, ctx, s)
+	seeded := h.seed(ctx, t, s)
 
-	first := h.keys(h.sweep(t, ctx, s))
-	second := h.keys(h.sweep(t, ctx, s))
+	first := h.keys(h.sweep(ctx, t, s))
+	second := h.keys(h.sweep(ctx, t, s))
 
 	if len(first) != len(seeded) {
 		t.Fatalf("List returned %d items, want the %d seeded", len(first), len(seeded))
@@ -370,7 +370,7 @@ func (h Harness[T, K]) testListStableOrder(t *testing.T) {
 func (h Harness[T, K]) testListPaginates(t *testing.T) {
 	ctx := t.Context()
 	s := h.NewStore(t)
-	seeded := h.seed(t, ctx, s)
+	seeded := h.seed(ctx, t, s)
 
 	seen := make(map[K]int, len(seeded))
 	pages := 0
@@ -475,7 +475,7 @@ func (h Harness[T, K]) testContextCanceled(t *testing.T) {
 
 // seed fills the store with 2*PageSize+1 items so pagination spans at least
 // three pages, and returns them.
-func (h Harness[T, K]) seed(t *testing.T, ctx context.Context, s Store[T, K]) []T {
+func (h Harness[T, K]) seed(ctx context.Context, t *testing.T, s Store[T, K]) []T {
 	t.Helper()
 	n := 2*h.PageSize + 1
 	items := make([]T, 0, n)
@@ -490,7 +490,7 @@ func (h Harness[T, K]) seed(t *testing.T, ctx context.Context, s Store[T, K]) []
 }
 
 // sweep walks every page and returns the items in the order List yielded them.
-func (h Harness[T, K]) sweep(t *testing.T, ctx context.Context, s Store[T, K]) []T {
+func (h Harness[T, K]) sweep(ctx context.Context, t *testing.T, s Store[T, K]) []T {
 	t.Helper()
 	var (
 		out   []T

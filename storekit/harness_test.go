@@ -168,6 +168,11 @@ const brokenEnv = "STOREKIT_TEST_BROKEN_ADAPTER"
 type brokenNoOverwrite struct{ *memStore }
 
 func (s *brokenNoOverwrite) Put(ctx context.Context, item widget) error {
+	// The s.memStore. qualifier is deliberate and kept even where Get is not
+	// shadowed: the sibling call below MUST be qualified to avoid recursing into
+	// this override. Mixing s.Get with s.memStore.Put would force a reader to
+	// know which methods are shadowed to parse four lines of code.
+	//nolint:staticcheck // QF1008: qualifier is intentional, see above.
 	if _, ok, err := s.memStore.Get(ctx, item.ID); err != nil || ok {
 		return err
 	}
@@ -209,6 +214,7 @@ func (s *brokenPagination) List(ctx context.Context, cur storekit.Cursor) ([]wid
 type brokenDeleteMissing struct{ *memStore }
 
 func (s *brokenDeleteMissing) Delete(ctx context.Context, key string) error {
+	//nolint:staticcheck // QF1008: qualifier intentional; Delete below is shadowed.
 	if _, ok, err := s.memStore.Get(ctx, key); err != nil {
 		return err
 	} else if !ok {
@@ -253,7 +259,10 @@ func TestHarnessRejectsBrokenAdapters(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.adapter, func(t *testing.T) {
-			cmd := exec.Command(os.Args[0], "-test.run=TestHarnessRejectsBrokenAdapters", "-test.v")
+			// #nosec G204,G702 -- os.Args[0] is this test binary; re-execing it is the
+			// only way to observe a *testing.T failure. The adapter name is from
+			// the fixed table above, not external input.
+			cmd := exec.CommandContext(t.Context(), os.Args[0], "-test.run=TestHarnessRejectsBrokenAdapters", "-test.v")
 			cmd.Env = append(os.Environ(), brokenEnv+"="+tc.adapter)
 			out, err := cmd.CombinedOutput()
 			if err == nil {
@@ -275,7 +284,8 @@ func TestHarnessRejectsBadWiring(t *testing.T) {
 		h.Run(t)
 		return
 	}
-	cmd := exec.Command(os.Args[0], "-test.run=TestHarnessRejectsBadWiring", "-test.v")
+	// #nosec G204,G702 -- re-exec of this test binary with a constant argv; see above.
+	cmd := exec.CommandContext(t.Context(), os.Args[0], "-test.run=TestHarnessRejectsBadWiring", "-test.v")
 	cmd.Env = append(os.Environ(), brokenEnv+"_WIRING=1")
 	out, err := cmd.CombinedOutput()
 	if err == nil {
