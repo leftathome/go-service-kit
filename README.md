@@ -21,10 +21,20 @@ This GitLab repo is the dev remote; the module resolves through
 
 ## Status
 
-Design approved, implementation not started. See the design spec in
+v0.1.0 -- all six packages implemented and tested. See the design spec in
 [`go-service-template`](https://gitlab.orac.local/homelab/go-service-template)
 at `docs/superpowers/specs/2026-07-28-go-service-template-design.md`.
 
 ## License
 
 Apache 2.0.
+
+## Install
+
+```bash
+go get github.com/leftathome/go-service-kit@v0.1.0
+```
+
+See [CHANGELOG.md](CHANGELOG.md) for what is in this release and the verified
+behavior notes (huma returns 422 for validation failures; otelhttp emits no
+request-count metric; Go runtime metrics are not the classic `go_*` names).
