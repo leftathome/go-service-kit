@@ -1,0 +1,14 @@
+version: "2"
+linters:
+  enable:
+    - errorlint
+    - bodyclose
+    - noctx
+    - copyloopvar
+    - gosec
+    - misspell
+    - revive
+formatters:
+  enable:
+    - gofumpt
+    - goimports
