@@ -56,6 +56,27 @@
 // Steps 3 through 5 run even when shutdown was triggered by a failure, and
 // step 5 runs even when step 3 timed out.
 //
+// # The propagation delay is pure downtime under replicas: 1 + Recreate
+//
+// Step 2 buys time for OTHER endpoints to take the traffic this pod is being
+// removed from. That premise fails in one common topology, and the package
+// used to describe the delay thoroughly without ever naming it.
+//
+// With replicas: 1 and strategy: Recreate there is no other replica. The old
+// pod is fully gone before the new one is created, so during the delay nothing
+// else is serving: every second is added to the deploy outage and no client is
+// spared a connection-refused, because there is nowhere else to route them.
+// The delay costs 4 seconds per deploy and buys nothing.
+//
+// Set [Spec.PropagationDelay] to [NoPropagationDelay] for that topology, and
+// say why in a comment where it is set. THE DEFAULT DOES NOT CHANGE: it is
+// correct for the multi-replica case, which is the case a service should be in,
+// and a service that later scales past one replica must put the delay back.
+//
+// Do not reach for this for a rolling update. With replicas > 1 and
+// RollingUpdate the delay is exactly what stops the connection-refused burst,
+// and removing it reintroduces the bug this package exists to prevent.
+//
 // # terminationGracePeriodSeconds
 //
 // The kubelet sends SIGKILL terminationGracePeriodSeconds after SIGTERM. If
@@ -77,6 +98,15 @@
 //	    Workers:   []lifecycle.Worker{{Name: "ingest", Run: ingest.Loop}},
 //	})
 //
+// A service with N independent background loops -- one per source, one per
+// tenant -- wants per-loop failure isolation rather than a process crash:
+//
+//	Workers: []lifecycle.Worker{{
+//	    Name:      "poll-ebay",
+//	    Run:       ebay.Loop,
+//	    OnFailure: lifecycle.RestartWithBackoff,
+//	}}
+//
 // Run blocks until the sequence is complete. It starts the servers; do not
 // call ListenAndServe yourself.
 package lifecycle
@@ -86,6 +116,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math/rand/v2"
 	"net"
 	"net/http"
 	"os"
@@ -93,6 +124,10 @@ import (
 	"sync"
 	"syscall"
 	"time"
+
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/metric"
 )
 
 // Sequence defaults. Every one is a Spec field with this as its zero-value
@@ -121,7 +156,67 @@ const (
 	// container runtime, and the fact that the phases are budgets rather than
 	// guarantees.
 	GracePeriodMargin = 5 * time.Second
+
+	// NoPropagationDelay disables step 2 entirely. Assign it to
+	// [Spec.PropagationDelay] rather than writing a bare negative duration, so
+	// the intent is greppable and reviewable.
+	//
+	// It is correct in exactly two situations: a process that is not behind a
+	// Service at all, and a Deployment with replicas: 1 and strategy: Recreate,
+	// where there is no other pod to receive the traffic and the wait is pure
+	// added downtime. See "The propagation delay is pure downtime under
+	// replicas: 1 + Recreate" in the package doc. It is WRONG for anything
+	// behind a Service with more than one replica.
+	NoPropagationDelay = -1 * time.Nanosecond
 )
+
+// Worker restart defaults, used when [Worker.OnFailure] is
+// [RestartWithBackoff]. Each is a [Backoff] field with this as its zero-value
+// fallback.
+const (
+	// DefaultRestartInitialDelay is the wait before the first restart.
+	DefaultRestartInitialDelay = 1 * time.Second
+
+	// DefaultRestartMaxDelay caps the exponential growth. A minute is short
+	// enough that a source which recovers is polled again promptly, and long
+	// enough that a source which is down for hours is not hammered.
+	DefaultRestartMaxDelay = 1 * time.Minute
+
+	// DefaultRestartFactor is the multiplier applied after each failure.
+	DefaultRestartFactor = 2.0
+
+	// DefaultRestartJitter is the fraction of the computed delay applied as
+	// random spread, in each direction. Six pollers that all fail the instant a
+	// shared database dies would otherwise retry in lockstep forever.
+	DefaultRestartJitter = 0.2
+
+	// DefaultRestartResetAfter is how long a worker must run without failing
+	// before its backoff is considered recovered and resets to the initial
+	// delay. Without it, a worker that fails once an hour eventually waits the
+	// maximum delay for a fault that is not actually escalating.
+	DefaultRestartResetAfter = 5 * time.Minute
+)
+
+// WorkerRestartsMetricName is the counter [Run] records for every worker
+// restart, as the name appears on /metrics after the OTel Prometheus
+// exporter's UnderscoreEscapingWithSuffixes translation that obs.Setup pins.
+// The instrument itself is [WorkerRestartsInstrumentName].
+//
+// It carries one attribute, "worker", which is [Worker.Name] and is therefore
+// bounded by the service's own wiring. Alert on it: the whole point of the
+// restart stance is that "one of my six pollers keeps dying" must be visible,
+// since it is by construction neither a process crash nor a silence.
+//
+//	rate(lifecycle_worker_restarts_total[15m]) > 0
+const (
+	WorkerRestartsInstrumentName = "lifecycle.worker.restarts"
+	WorkerRestartsMetricName     = "lifecycle_worker_restarts_total"
+)
+
+// ScopeName is the instrumentation scope for this package's own telemetry. It
+// appears as otel_scope_name on every series above. It is declared here rather
+// than imported from obs: the kit's packages have no edges between siblings.
+const ScopeName = "github.com/leftathome/go-service-kit/lifecycle"
 
 // Sentinel errors, so a caller can tell an orderly shutdown that hit a budget
 // from one that failed outright.
@@ -133,10 +228,177 @@ var (
 	// ErrWorkerStopTimeout means a FinishCurrentCycle worker did not return
 	// within WorkerStopTimeout.
 	ErrWorkerStopTimeout = errors.New("lifecycle: worker did not stop within its budget")
+
+	// ErrWorkerRestartsExhausted means a RestartWithBackoff worker exceeded
+	// Backoff.MaxRestarts and its failure was escalated to a process shutdown.
+	ErrWorkerRestartsExhausted = errors.New("lifecycle: worker exhausted its restart budget")
 )
+
+// RestartPolicy selects what happens when a [Worker.Run] returns a non-nil
+// error or panics.
+type RestartPolicy int
+
+const (
+	// CrashProcess is the DEFAULT (the zero value). The failure triggers the
+	// whole shutdown sequence and [Run] returns the error. A worker whose loop
+	// has died while the service keeps reporting ready is worse than a restart,
+	// so for a service whose background work IS the service, crashing is right:
+	// the pod restarts, the alert fires on the restart count, and the failure
+	// is impossible to miss.
+	CrashProcess RestartPolicy = iota
+
+	// RestartWithBackoff restarts the worker after an exponentially increasing
+	// delay instead of taking the process down.
+	//
+	// This is the stance for N INDEPENDENT background loops, which is what the
+	// other two stances do not cover. nagus polls six connectors -- eBay,
+	// several Shopify storefronts, a land source -- on independent intervals,
+	// and its whole design is per-source failure isolation: one storefront
+	// returning 429 for an hour must not stop the other five and must not take
+	// down the read surface. With only CrashProcess available, such a service
+	// is forced to swallow every error inside its own loop and never return
+	// one, which turns the kit's "a dead loop is worse than a restart"
+	// guarantee into a no-op and makes a permanently wedged poller invisible.
+	//
+	// Restarts are LOUD, which is the difference between this and swallowing:
+	// each one logs at ERROR with the worker name, the error, the consecutive
+	// failure count and the next delay, and increments
+	// [WorkerRestartsMetricName]. Alert on the counter.
+	//
+	// Set [Backoff.MaxRestarts] to escalate to a process crash after N
+	// consecutive failures, for a worker that the service genuinely cannot run
+	// without.
+	RestartWithBackoff
+)
+
+// String makes the policy readable in a log line.
+func (p RestartPolicy) String() string {
+	switch p {
+	case CrashProcess:
+		return "crash_process"
+	case RestartWithBackoff:
+		return "restart_with_backoff"
+	default:
+		return "unknown"
+	}
+}
+
+// Backoff is the restart schedule for a [RestartWithBackoff] worker. The zero
+// value is valid and means the documented defaults.
+type Backoff struct {
+	// Initial is the wait before the first restart. Zero means
+	// [DefaultRestartInitialDelay]; negative is treated as zero, i.e. restart
+	// immediately, which is almost never what you want for a failing
+	// dependency.
+	Initial time.Duration
+
+	// Max caps the delay. Zero means [DefaultRestartMaxDelay].
+	Max time.Duration
+
+	// Factor multiplies the delay after each consecutive failure. Zero means
+	// [DefaultRestartFactor]. A value below 1 is raised to 1, which yields a
+	// constant delay rather than a shrinking one.
+	Factor float64
+
+	// Jitter spreads each delay by this fraction in each direction, so that
+	// workers which failed together do not retry together. Zero means
+	// [DefaultRestartJitter]; NEGATIVE means no jitter at all, which is the
+	// spelling a test uses when it needs an exact schedule. Values above 1 are
+	// clamped to 1.
+	Jitter float64
+
+	// ResetAfter is how long a restarted worker must run before the delay
+	// sequence resets to Initial. Zero means [DefaultRestartResetAfter];
+	// negative disables the reset, so the delay only ever grows.
+	ResetAfter time.Duration
+
+	// MaxRestarts escalates to a process crash after this many CONSECUTIVE
+	// failures (consecutive in the ResetAfter sense above). Zero, the default,
+	// means restart forever -- the right answer for one poller among many.
+	// Set it for a worker the service cannot usefully run without.
+	MaxRestarts int
+}
+
+// WithDefaults returns a copy with every zero-valued field filled in and every
+// out-of-range field clamped.
+func (b Backoff) WithDefaults() Backoff {
+	if b.Initial == 0 {
+		b.Initial = DefaultRestartInitialDelay
+	}
+	if b.Initial < 0 {
+		b.Initial = 0
+	}
+	if b.Max == 0 {
+		b.Max = DefaultRestartMaxDelay
+	}
+	if b.Max < b.Initial {
+		b.Max = b.Initial
+	}
+	if b.Factor == 0 {
+		b.Factor = DefaultRestartFactor
+	}
+	if b.Factor < 1 {
+		b.Factor = 1
+	}
+	if b.Jitter == 0 {
+		b.Jitter = DefaultRestartJitter
+	}
+	if b.Jitter < 0 {
+		b.Jitter = 0
+	}
+	if b.Jitter > 1 {
+		b.Jitter = 1
+	}
+	if b.ResetAfter == 0 {
+		b.ResetAfter = DefaultRestartResetAfter
+	}
+	if b.ResetAfter < 0 {
+		b.ResetAfter = 0
+	}
+	return b
+}
+
+// delay returns the wait before restart number n (1-based), with jitter
+// applied. It is deterministic when Jitter resolves to 0.
+func (b Backoff) delay(n int) time.Duration {
+	d := float64(b.Initial)
+	for range n - 1 {
+		d *= b.Factor
+		if d >= float64(b.Max) {
+			d = float64(b.Max)
+			break
+		}
+	}
+	if d > float64(b.Max) {
+		d = float64(b.Max)
+	}
+	if b.Jitter > 0 && d > 0 {
+		// Uniform in [d*(1-j), d*(1+j)], then re-capped: a jittered delay must
+		// not exceed Max, or the cap is not a cap.
+		spread := d * b.Jitter
+		d += spread * (2*rand.Float64() - 1) //nolint:gosec // scheduling jitter, not a secret
+		if d > float64(b.Max) {
+			d = float64(b.Max)
+		}
+		if d < 0 {
+			d = 0
+		}
+	}
+	return time.Duration(d)
+}
 
 // Worker is a background loop the process owns: an ingest poller, a
 // reconciler, a cache warmer.
+//
+// # Two independent stances
+//
+// A Worker declares two things, and they answer different questions:
+//
+//   - [Worker.OnFailure] -- what happens when Run FAILS while the process is
+//     healthy: take the process down ([CrashProcess], the default), or restart
+//     the worker with backoff ([RestartWithBackoff]).
+//   - [Worker.FinishCurrentCycle] -- what happens during SHUTDOWN: whether the
+//     sequence waits for Run to return.
 //
 // # The finish-current-cycle vs abort stance
 //
@@ -173,15 +435,27 @@ type Worker struct {
 	// Run executes the worker in its own goroutine, started by [Run]. It must
 	// return when ctx is done.
 	//
-	// Returning a non-nil error is a CRASH: it initiates the whole shutdown
-	// sequence and [Run] returns that error. A worker whose loop has died
-	// while the service keeps reporting ready is worse than a restart.
+	// Returning a non-nil error invokes [Worker.OnFailure]: by default that is
+	// a CRASH, initiating the whole shutdown sequence and making [Run] return
+	// the error, because a worker whose loop has died while the service keeps
+	// reporting ready is worse than a restart. With [RestartWithBackoff] the
+	// worker is restarted instead, loudly.
 	//
-	// Returning nil means the job is finished. The process carries on.
+	// Returning nil means the job is finished. The process carries on and the
+	// worker is NOT restarted under any policy: nil is "done", not "failed".
 	//
-	// A panic is recovered, reported as an error, and treated as a crash, so
-	// that a worker bug still gets an orderly drain and flush.
+	// A panic is recovered and reported as an error, so a worker bug still
+	// gets an orderly drain and flush -- or, under RestartWithBackoff, a
+	// restart rather than a lost goroutine.
 	Run func(ctx context.Context) error
+
+	// OnFailure selects what a non-nil error from Run does. Default
+	// [CrashProcess].
+	OnFailure RestartPolicy
+
+	// Backoff is the restart schedule. It is read only when OnFailure is
+	// [RestartWithBackoff]; the zero value means the documented defaults.
+	Backoff Backoff
 
 	// FinishCurrentCycle selects the shutdown stance above. Default false
 	// (abort).
@@ -215,9 +489,19 @@ type Spec struct {
 	Readiness interface{ SetShuttingDown() }
 
 	// PropagationDelay is how long the listeners keep serving after the
-	// readiness flip. Zero means DefaultPropagationDelay; negative disables
-	// the wait, which is only correct for a process that is not behind a
-	// Service.
+	// readiness flip. Zero means [DefaultPropagationDelay].
+	//
+	// Set it to [NoPropagationDelay] to disable the wait. That is correct in
+	// exactly two cases: a process that is not behind a Service, and a
+	// Deployment with replicas: 1 and strategy: Recreate, where there is no
+	// other pod to receive the traffic being withdrawn and the wait is pure
+	// added downtime -- 4 seconds of outage per deploy, buying nothing. See
+	// "The propagation delay is pure downtime under replicas: 1 + Recreate" in
+	// the package doc, and state the reason in a comment wherever you set it,
+	// because it stops being true the moment the service scales to two.
+	//
+	// Everywhere else, shortening it reintroduces the connection-refused burst
+	// this package exists to prevent.
 	PropagationDelay time.Duration
 
 	// DrainTimeout bounds the in-flight request drain. Zero means
@@ -251,6 +535,12 @@ type Spec struct {
 	// The log line at each transition is what turns "the deploy dropped
 	// requests" into a five-minute diagnosis.
 	Logger *slog.Logger
+
+	// MeterProvider records [WorkerRestartsMetricName]. Pass
+	// obs.Providers.MeterProvider. Nil means the OTel global, which obs.Setup
+	// installs, so the counter is exported without wiring for any service that
+	// calls obs.Setup -- and is a no-op for any service that does not.
+	MeterProvider metric.MeterProvider
 }
 
 // WithDefaults returns a copy with every zero-valued budget filled in. Run
@@ -511,6 +801,8 @@ type workerHandle struct {
 }
 
 func startWorkers(ctx context.Context, spec Spec, log *slog.Logger, fire func(error)) []workerHandle {
+	restarts := newRestartCounter(spec.MeterProvider)
+
 	handles := make([]workerHandle, 0, len(spec.Workers))
 	for _, w := range spec.Workers {
 		if w.Run == nil {
@@ -522,21 +814,119 @@ func startWorkers(ctx context.Context, spec Spec, log *slog.Logger, fire func(er
 
 		go func() {
 			defer close(h.done)
-			err := safeRun(wctx, w.Run)
-			if err == nil {
-				return
-			}
-			// Cancellation is how shutdown ASKS a worker to stop. Reporting it
-			// as a failure would make every clean shutdown return an error.
-			if wctx.Err() != nil && errors.Is(err, context.Canceled) {
-				return
-			}
-			log.Error("lifecycle: worker failed",
-				slog.String("worker", w.Name), slog.String("error", err.Error()))
-			fire(fmt.Errorf("lifecycle: worker %s: %w", w.Name, err))
+			superviseWorker(wctx, w, log, fire, restarts)
 		}()
 	}
 	return handles
+}
+
+// superviseWorker runs one worker and applies its failure policy. Under
+// [CrashProcess] it runs exactly once, which is the pre-existing behaviour.
+func superviseWorker(
+	ctx context.Context,
+	w Worker,
+	log *slog.Logger,
+	fire func(error),
+	restarts func(context.Context, string),
+) {
+	backoff := w.Backoff.WithDefaults()
+	consecutive := 0
+
+	for {
+		started := time.Now()
+		err := safeRun(ctx, w.Run)
+		if err == nil {
+			// Finished, not failed. Nothing restarts a completed job.
+			return
+		}
+		// Cancellation is how shutdown ASKS a worker to stop. Reporting it as a
+		// failure would make every clean shutdown return an error, and
+		// restarting into an already-cancelled context would spin.
+		if ctx.Err() != nil {
+			if errors.Is(err, context.Canceled) {
+				return
+			}
+			// A different error during shutdown is worth a line, but the
+			// process is already going down: do not restart, do not fire.
+			log.Warn("lifecycle: worker failed while shutting down",
+				slog.String("worker", w.Name), slog.String("error", err.Error()))
+			return
+		}
+
+		if w.OnFailure != RestartWithBackoff {
+			log.Error("lifecycle: worker failed",
+				slog.String("worker", w.Name),
+				slog.String("policy", w.OnFailure.String()),
+				slog.String("error", err.Error()))
+			fire(fmt.Errorf("lifecycle: worker %s: %w", w.Name, err))
+			return
+		}
+
+		// A worker that ran for a good while before failing is recovering, not
+		// escalating: start its schedule over.
+		if backoff.ResetAfter > 0 && time.Since(started) >= backoff.ResetAfter {
+			consecutive = 0
+		}
+		consecutive++
+
+		if backoff.MaxRestarts > 0 && consecutive > backoff.MaxRestarts {
+			log.Error("lifecycle: worker exhausted its restart budget",
+				slog.String("worker", w.Name),
+				slog.Int("restarts", consecutive-1),
+				slog.Int("max_restarts", backoff.MaxRestarts),
+				slog.String("error", err.Error()))
+			fire(fmt.Errorf("%w: %s after %d restarts: %w",
+				ErrWorkerRestartsExhausted, w.Name, backoff.MaxRestarts, err))
+			return
+		}
+
+		// Counted only once the restart is actually going to happen, so the
+		// counter is restarts and not failures; the escalating failure above is
+		// a crash, which the pod restart count already records.
+		restarts(ctx, w.Name)
+
+		delay := backoff.delay(consecutive)
+		// ERROR, not WARN: a worker restarting is not routine. This line and
+		// WorkerRestartsMetricName are the entire difference between this
+		// stance and a service swallowing the error in its own loop.
+		log.Error("lifecycle: worker failed, restarting",
+			slog.String("worker", w.Name),
+			slog.Int("consecutive_failures", consecutive),
+			slog.Duration("delay", delay),
+			slog.String("error", err.Error()))
+
+		if delay > 0 {
+			timer := time.NewTimer(delay)
+			select {
+			case <-timer.C:
+			case <-ctx.Done():
+				timer.Stop()
+				return
+			}
+		} else if ctx.Err() != nil {
+			return
+		}
+	}
+}
+
+// newRestartCounter returns the increment function for
+// [WorkerRestartsMetricName]. Instrument creation failing must not stop the
+// process from running its workers, so the fallback is a no-op.
+func newRestartCounter(mp metric.MeterProvider) func(context.Context, string) {
+	if mp == nil {
+		mp = otel.GetMeterProvider()
+	}
+	counter, err := mp.Meter(ScopeName).Int64Counter(
+		WorkerRestartsInstrumentName,
+		metric.WithDescription("Background worker restarts, by worker name."),
+		metric.WithUnit("{restart}"),
+	)
+	if err != nil {
+		return func(context.Context, string) {}
+	}
+	return func(ctx context.Context, name string) {
+		counter.Add(ctx, 1, metric.WithAttributes(attribute.String("worker", name)))
+	}
 }
 
 // safeRun turns a worker panic into an error. An unrecovered panic here would
