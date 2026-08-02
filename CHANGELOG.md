@@ -4,6 +4,27 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and this project adheres
 to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.2] - 2026-08-02
+
+### Security
+
+- **Bumped `google.golang.org/grpc` v1.81.1 -> v1.82.1** for GO-2026-6061.
+  The dependency arrives via the OTLP trace exporter, so every service built on
+  the kit inherited it. `govulncheck` now reports no vulnerabilities.
+
+### Fixed
+
+- **`make lint` assumed `golangci-lint` was on PATH.** It is not on a stock CI
+  runner, so this repository's GitHub Actions workflow was red from its first
+  commit -- `make: golangci-lint: No such file or directory` -- while every
+  local run looked green, because this machine has the binary installed. The
+  target now prefers a binary on PATH and falls back to a pinned
+  `go run` invocation, matching go-service-template. Both CIs call `make lint`,
+  so the resolution belongs in one place.
+- `govulncheck` was invoked as `@latest`, which makes the gate
+  non-reproducible: a build could start failing because a tool moved rather
+  than because the code changed. Pinned to v1.6.0.
+
 ## [0.1.1] - 2026-08-02
 
 ### Fixed
@@ -98,5 +119,6 @@ Database adapters (per-service; a SQLite adapter must use a pure-Go driver such
 as `modernc.org/sqlite` to stay CGO-free), authentication middleware beyond a
 reserved slot, and an MCP surface.
 
+[0.1.2]: https://github.com/leftathome/go-service-kit/releases/tag/v0.1.2
 [0.1.1]: https://github.com/leftathome/go-service-kit/releases/tag/v0.1.1
 [0.1.0]: https://github.com/leftathome/go-service-kit/releases/tag/v0.1.0
