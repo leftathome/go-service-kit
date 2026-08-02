@@ -193,7 +193,7 @@ func TestRateLimitedByDefault(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	if got := float64(c.limiter.Limit()); got != DefaultRequestsPerSecond {
+	if got := float64(c.eng.limiter.Limit()); got != DefaultRequestsPerSecond {
 		t.Fatalf("default limit = %v, want %v", got, DefaultRequestsPerSecond)
 	}
 }
@@ -375,7 +375,7 @@ func TestBackoffIsCappedAtMaxBackoff(t *testing.T) {
 		jitter:      func(d time.Duration) time.Duration { return d },
 	})
 	for attempt, want := range map[int]time.Duration{1: time.Second, 2: 2 * time.Second, 3: 4 * time.Second, 9: 4 * time.Second} {
-		if got := c.backoff(attempt); got != want {
+		if got := c.eng.backoff(attempt); got != want {
 			t.Errorf("backoff(%d) = %v, want %v", attempt, got, want)
 		}
 	}

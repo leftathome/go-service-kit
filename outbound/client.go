@@ -24,6 +24,26 @@
 //     public API: a private CA belongs in the system trust store or
 //     SSL_CERT_FILE, not in a constructor option.
 //
+// # Three shapes, one policy
+//
+// Every guarantee above holds identically whichever of these a service takes.
+// They are the same engine behind three surfaces, so no adoption path is
+// weaker than another. Pick by what the calling code already looks like:
+//
+//	c, err := outbound.New(cfg)            // *Client: Get/Do, the native shape
+//	tr, err := outbound.NewTransport(cfg)  // http.RoundTripper: hc.Transport = tr
+//	hc, err := outbound.NewHTTPClient(cfg) // *http.Client, for an SDK that demands one
+//
+// [Client.Transport] and [Client.HTTPClient] hand out the other two shapes
+// backed by the SAME limiter and the SAME call budget, so a service can convert
+// call sites one at a time without accidentally running two quotas against one
+// remote.
+//
+// Better still, type the dependency as [Doer] and the choice stops mattering at
+// the call site. nagus is the reason both of these exist: six integrations
+// declared HTTPClient *http.Client, so adopting the kit's egress policy was six
+// files of mechanical edits for no behavioural reason.
+//
 // # Terms-of-service discipline
 //
 // Every integration MUST record the remote's rate limits and terms constraints
@@ -32,16 +52,29 @@
 // the comment is the half that says why. Following the eBay Developer Program
 // License 8.1(b) precedent already set in nagus:
 //
-//	// eBay Browse API: 5,000 calls/day on the production keyset; License
-//	// 8.1(b) forbids retaining item data beyond 24h. Budget below is the
-//	// daily cap; the retention rule lives in the store's TTL.
+//	// eBay Browse API: 5,000 calls/day on the production keyset, per UTC
+//	// day; License 8.1(b) forbids retaining item data beyond 24h. The
+//	// retention rule lives in the store's TTL. MaxAttempts is 1 because a
+//	// metered API is the wrong place for a silent retry: the quota is
+//	// charged per attempt, not per logical call.
+//	daily, err := outbound.NewWindowedBudget(outbound.BudgetConfig{
+//	        Limit: 5000, Window: 24 * time.Hour, Calendar: true,
+//	})
 //	c, err := outbound.New(outbound.Config{
 //	        Product: "nagus", Version: build.Version,
 //	        ContactURL: "https://example.org/bots",
 //	        Timeout: 20 * time.Second,
 //	        RequestsPerSecond: 2, Burst: 2,
-//	        CallBudget: 5000,
+//	        MaxAttempts: 1,
+//	        Budget: daily,
 //	})
+//
+// Feed the server's own accounting back in whenever it offers one -- it is
+// authoritative and the local ledger is a guess:
+//
+//	if n, err := strconv.ParseInt(resp.Header.Get("X-RateLimit-Remaining"), 10, 64); err == nil {
+//	        daily.Observe(n)
+//	}
 //
 // A terms-of-use ban on automated collection applies whether the collection
 // happens through an RSS feed, an undocumented internal JSON endpoint, or a
@@ -101,9 +134,11 @@ type CallEvent struct {
 	Duration     time.Duration // time spent in the round trip
 	LimiterDelay time.Duration // time spent waiting on the rate limiter
 
-	// CallsUsed is the cumulative number of attempts this client has made.
-	// BudgetRemaining is what is left of Config.CallBudget, or -1 when no
-	// budget is configured.
+	// CallsUsed is the cumulative number of attempts this client has made
+	// since it was constructed -- a process-lifetime count, which after a
+	// windowed budget rolls is deliberately NOT the same as the budget's own
+	// Used. BudgetRemaining is what the budget had left after this attempt
+	// was charged, or -1 when the client is unmetered.
 	CallsUsed       int64
 	BudgetRemaining int64
 }
@@ -172,9 +207,20 @@ type Config struct {
 	AllowPrivateNetworks bool
 
 	// CallBudget, when positive, is the maximum number of attempts this client
-	// will ever make; further calls fail with ErrCallBudgetExhausted. Use it to
-	// encode a documented daily/keyset quota in code.
+	// will ever make, for the LIFETIME OF THE PROCESS; further calls fail with
+	// ErrCallBudgetExhausted.
+	//
+	// Real quotas are windowed and are often reported by the server, which a
+	// process-lifetime counter cannot express: a pod that lives a week does
+	// not get one day's worth of a daily quota. Prefer Budget, and reach for
+	// CallBudget only for a genuine "this process must never make more than N
+	// calls" ceiling. It is exactly BudgetConfig{Limit: N} with no window.
+	// The two are mutually exclusive.
 	CallBudget int64
+
+	// Budget meters attempts against a real quota: windowed, resettable, and
+	// able to take a server-reported remaining count. See [WindowedBudget].
+	Budget Budget
 
 	// Metrics receives one CallEvent per attempt. Optional.
 	Metrics Metrics
@@ -188,8 +234,24 @@ type Config struct {
 
 // Client is a rate-limited, retrying, SSRF-guarded HTTP client. It is safe for
 // concurrent use. Construct it with New; the zero value is not usable.
+//
+// A service that already has *http.Client-shaped call sites does not have to
+// change them: see [Doer], [Client.Transport] and [Client.HTTPClient].
 type Client struct {
-	hc           *http.Client
+	eng *engine
+	hc  *http.Client
+
+	// tr and adopted expose the same policy and the same engine -- therefore
+	// the same limiter and the same budget -- to callers that need a
+	// RoundTripper or a concrete *http.Client.
+	tr      *Transport
+	adopted *http.Client
+}
+
+// engine holds the per-call policy shared by Client and Transport: identity,
+// pacing, retries, budget and the metrics seam. Keeping it in one place is why
+// adopting the RoundTripper cannot quietly get a weaker client than Client.Do.
+type engine struct {
 	limiter      *rate.Limiter
 	userAgent    string
 	maxAttempts  int
@@ -198,14 +260,74 @@ type Client struct {
 	maxRetryWait time.Duration
 	schemes      map[string]bool
 	metrics      Metrics
-	budget       int64
+	budget       Budget
 	used         atomic.Int64
 	jitter       func(time.Duration) time.Duration
+}
+
+// sendFunc performs one attempt. Client.Do supplies http.Client.Do (so the
+// stdlib handles redirects above the retry loop); Transport supplies a single
+// guarded round trip.
+type sendFunc func(*http.Request) (*http.Response, error)
+
+// built is the validated, constructed policy, from which any of the three
+// public shapes can be handed out.
+type built struct {
+	eng          *engine
+	base         http.RoundTripper
+	timeout      time.Duration
+	maxRedirects int
+	sensitive    map[string]bool
+}
+
+func (b *built) transport() *Transport {
+	return &Transport{
+		eng:          b.eng,
+		base:         b.base,
+		timeout:      b.timeout,
+		maxRedirects: b.maxRedirects,
+		sensitive:    b.sensitive,
+	}
+}
+
+func (b *built) httpClient() *http.Client {
+	// CheckRedirect as well as the Transport's own strip: the transport covers
+	// a caller who attaches it to their own bare client, this covers the hop
+	// before the transport ever sees it. Neither is redundant enough to drop.
+	return &http.Client{
+		Transport:     b.transport(),
+		CheckRedirect: checkRedirect(b.maxRedirects, b.sensitive),
+	}
 }
 
 // New validates cfg and builds a client. It returns an aggregated error
 // describing every problem rather than the first one found.
 func New(cfg Config) (*Client, error) {
+	b, err := build(cfg)
+	if err != nil {
+		return nil, err
+	}
+	c := &Client{
+		eng: b.eng,
+		hc: &http.Client{
+			Timeout:       b.timeout,
+			Transport:     b.base,
+			CheckRedirect: checkRedirect(b.maxRedirects, b.sensitive),
+		},
+		tr: b.transport(),
+	}
+	// Share the engine, so a service migrating call sites one at a time runs
+	// one limiter and one budget, not two.
+	c.adopted = &http.Client{
+		Transport:     c.tr,
+		CheckRedirect: checkRedirect(b.maxRedirects, b.sensitive),
+	}
+	return c, nil
+}
+
+// build validates cfg once for New, NewTransport and NewHTTPClient, so no
+// public constructor can produce a client with weaker guarantees than another.
+func build(cfg Config) (*built, error) {
 	var errs []error
 
 	if strings.TrimSpace(cfg.Product) == "" {
@@ -239,6 +361,11 @@ func New(cfg Config) (*Client, error) {
 		}
 	}
 
+	budget, err := budgetFor(cfg)
+	if err != nil {
+		errs = append(errs, err)
+	}
+
 	if len(errs) > 0 {
 		return nil, errors.Join(errs...)
 	}
@@ -256,7 +383,7 @@ func New(cfg Config) (*Client, error) {
 		limiter = rate.NewLimiter(rate.Limit(rps), burst)
 	}
 
-	c := &Client{
+	eng := &engine{
 		limiter:      limiter,
 		userAgent:    userAgent(cfg),
 		maxAttempts:  orInt(cfg.MaxAttempts, DefaultMaxAttempts),
@@ -265,25 +392,25 @@ func New(cfg Config) (*Client, error) {
 		maxRetryWait: orDuration(cfg.MaxRetryWait, DefaultMaxRetryWait),
 		schemes:      schemes,
 		metrics:      cfg.Metrics,
-		budget:       cfg.CallBudget,
+		budget:       budget,
 		jitter:       cfg.jitter,
 	}
-	if c.jitter == nil {
-		c.jitter = defaultJitter
+	if eng.jitter == nil {
+		eng.jitter = defaultJitter
 	}
 
 	extra := make(map[string]bool, len(cfg.SensitiveHeaders))
 	for _, h := range cfg.SensitiveHeaders {
 		extra[strings.ToLower(strings.TrimSpace(h))] = true
 	}
-	maxRedirects := orInt(cfg.MaxRedirects, DefaultMaxRedirects)
 
-	c.hc = &http.Client{
-		Timeout:       cfg.Timeout,
-		Transport:     transportFor(cfg),
-		CheckRedirect: checkRedirect(maxRedirects, extra),
-	}
-	return c, nil
+	return &built{
+		eng:          eng,
+		base:         transportFor(cfg),
+		timeout:      cfg.Timeout,
+		maxRedirects: orInt(cfg.MaxRedirects, DefaultMaxRedirects),
+		sensitive:    extra,
+	}, nil
 }
 
 // transportFor builds the guarded transport. The returned transport always has
@@ -407,9 +534,33 @@ func orDuration(v, def time.Duration) time.Duration {
 	return v
 }
 
-// CallsUsed reports how many attempts this client has made. It is the
-// consumption half of the call budget and is also carried on every CallEvent.
-func (c *Client) CallsUsed() int64 { return c.used.Load() }
+// CallsUsed reports how many attempts this client has made since it was
+// constructed. It is also carried on every CallEvent.
+//
+// It is a PROCESS-LIFETIME count and is not the same number as a windowed
+// budget's Used: a client on a per-UTC-day budget will report a CallsUsed far
+// above Stats().Used after the first roll. Ask the budget about the quota; ask
+// the client about the client.
+func (c *Client) CallsUsed() int64 { return c.eng.used.Load() }
+
+// Budget returns the configured call budget, or nil when this client is
+// unmetered. Use it to feed a server-reported remaining count back in, or to
+// publish the quota as a metric:
+//
+//	if b := c.Budget(); b != nil {
+//	        b.Observe(remainingFromHeader)
+//	}
+func (c *Client) Budget() Budget { return c.eng.budget }
+
+// BudgetRemaining reports what is left of the call budget, or -1 when this
+// client is unmetered. It is the accessor the CallEvent side channel was
+// previously the only source of.
+func (c *Client) BudgetRemaining() int64 {
+	if c.eng.budget == nil {
+		return -1
+	}
+	return c.eng.budget.Stats().Remaining
+}
 
 // Get issues a GET. The context is required: there is no context-less helper.
 func (c *Client) Get(ctx context.Context, rawURL string) (*http.Response, error) {
@@ -428,27 +579,35 @@ func (c *Client) Get(ctx context.Context, rawURL string) (*http.Response, error)
 // Config.Timeout bounds each attempt. Bound the whole call -- limiter waits,
 // retries and all -- with the request context.
 func (c *Client) Do(req *http.Request) (*http.Response, error) {
+	return c.eng.do(req, c.hc.Do)
+}
+
+// do is the retry loop, shared by Client.Do and Transport.RoundTrip. send
+// performs one attempt: for a Client that is http.Client.Do (redirects handled
+// above the retry loop, as they always were); for a Transport it is a single
+// guarded round trip.
+func (e *engine) do(req *http.Request, send sendFunc) (*http.Response, error) {
 	if req == nil || req.URL == nil {
 		return nil, errors.New("outbound: nil request")
 	}
-	if !c.schemes[strings.ToLower(req.URL.Scheme)] {
+	if !e.schemes[strings.ToLower(req.URL.Scheme)] {
 		return nil, fmt.Errorf("%w: %q", ErrDisallowedScheme, req.URL.Scheme)
 	}
 
 	ctx := req.Context()
 	outreq := req.Clone(ctx)
 	// Identity is client policy, not per-request decoration.
-	outreq.Header.Set("User-Agent", c.userAgent)
+	outreq.Header.Set("User-Agent", e.userAgent)
 	replayable := outreq.Body == nil || outreq.GetBody != nil
 
 	for attempt := 1; ; attempt++ {
-		used, remaining, ok := c.consume()
+		used, remaining, ok := e.consume()
 		if !ok {
-			return nil, fmt.Errorf("%w after %d calls", ErrCallBudgetExhausted, c.budget)
+			return nil, e.budgetExhausted()
 		}
 
 		waitStart := time.Now()
-		if err := c.limiter.Wait(ctx); err != nil {
+		if err := e.limiter.Wait(ctx); err != nil {
 			return nil, fmt.Errorf("outbound: rate limiter: %w", err)
 		}
 		limiterDelay := time.Since(waitStart)
@@ -462,7 +621,7 @@ func (c *Client) Do(req *http.Request) (*http.Response, error) {
 		}
 
 		start := time.Now()
-		resp, err := c.hc.Do(outreq) //nolint:bodyclose // returned to the caller or drained below
+		resp, err := send(outreq) //nolint:bodyclose // returned to the caller or drained below
 		ev := CallEvent{
 			Host:            outreq.URL.Host,
 			Method:          outreq.Method,
@@ -476,15 +635,15 @@ func (c *Client) Do(req *http.Request) (*http.Response, error) {
 		if resp != nil {
 			ev.StatusCode = resp.StatusCode
 		}
-		c.record(ev)
+		e.record(ev)
 
 		if err != nil {
 			return nil, err
 		}
-		if attempt >= c.maxAttempts || !retryableStatus(resp.StatusCode) || !replayable {
+		if attempt >= e.maxAttempts || !retryableStatus(resp.StatusCode) || !replayable {
 			return resp, nil
 		}
-		delay, retry := c.retryDelay(resp, attempt)
+		delay, retry := e.retryDelay(resp, attempt)
 		if !retry {
 			return resp, nil
 		}
@@ -495,24 +654,35 @@ func (c *Client) Do(req *http.Request) (*http.Response, error) {
 	}
 }
 
-func (c *Client) record(ev CallEvent) {
-	if c.metrics != nil {
-		c.metrics.RecordCall(ev)
+func (e *engine) record(ev CallEvent) {
+	if e.metrics != nil {
+		e.metrics.RecordCall(ev)
 	}
 }
 
-// consume takes one unit of call budget. It reports the cumulative count, what
-// remains (-1 when unbudgeted), and whether the call may proceed.
-func (c *Client) consume() (used, remaining int64, ok bool) {
-	used = c.used.Add(1)
-	if c.budget <= 0 {
-		return used, -1, true
+// consume takes one unit of call budget. It reports this engine's cumulative
+// attempt count, what the budget has left (-1 when unmetered), and whether the
+// call may proceed. Nothing is charged when it may not.
+func (e *engine) consume() (used, remaining int64, ok bool) {
+	if e.budget == nil {
+		return e.used.Add(1), -1, true
 	}
-	if used > c.budget {
-		c.used.Add(-1)
-		return c.used.Load(), 0, false
+	if _, remaining, ok = e.budget.Reserve(); !ok {
+		return e.used.Load(), 0, false
 	}
-	return used, c.budget - used, true
+	return e.used.Add(1), remaining, true
+}
+
+// budgetExhausted describes the quota that refused the call. The window bounds
+// are included when there are any, because "wait until 00:00 UTC" is the
+// actionable half of the message.
+func (e *engine) budgetExhausted() error {
+	st := e.budget.Stats()
+	if st.WindowEnd.IsZero() {
+		return fmt.Errorf("%w: %d of %d used", ErrCallBudgetExhausted, st.Used, st.Limit)
+	}
+	return fmt.Errorf("%w: %d of %d used in the window ending %s",
+		ErrCallBudgetExhausted, st.Used, st.Limit, st.WindowEnd.UTC().Format(time.RFC3339))
 }
 
 func retryableStatus(code int) bool {
@@ -522,26 +692,26 @@ func retryableStatus(code int) bool {
 // retryDelay prefers the server's Retry-After and falls back to backoff. It
 // reports false when the wait the server asked for exceeds MaxRetryWait: the
 // caller gets the response back rather than having the goroutine parked.
-func (c *Client) retryDelay(resp *http.Response, attempt int) (time.Duration, bool) {
+func (e *engine) retryDelay(resp *http.Response, attempt int) (time.Duration, bool) {
 	if d, ok := parseRetryAfter(resp.Header.Get("Retry-After"), time.Now()); ok {
-		if d > c.maxRetryWait {
+		if d > e.maxRetryWait {
 			return 0, false
 		}
 		return max(d, 0), true
 	}
-	return c.backoff(attempt), true
+	return e.backoff(attempt), true
 }
 
 // backoff is base * 2^(attempt-1), capped, then jittered.
-func (c *Client) backoff(attempt int) time.Duration {
-	d := c.baseBackoff
+func (e *engine) backoff(attempt int) time.Duration {
+	d := e.baseBackoff
 	for range attempt - 1 {
 		d *= 2
-		if d >= c.maxBackoff {
-			return c.jitter(c.maxBackoff)
+		if d >= e.maxBackoff {
+			return e.jitter(e.maxBackoff)
 		}
 	}
-	return c.jitter(d)
+	return e.jitter(d)
 }
 
 // defaultJitter returns a duration in [d/2, d] -- enough spread to break up
