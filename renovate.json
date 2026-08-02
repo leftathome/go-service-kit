@@ -1,0 +1,94 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": [
+    "config:recommended",
+    ":semanticCommits",
+    ":dependencyDashboard"
+  ],
+  "timezone": "America/New_York",
+  "labels": ["dependencies"],
+  "postUpdateOptions": ["gomodTidy"],
+
+  "description": [
+    "This is a LIBRARY, not a deployable. It has no Dockerfile and no chart,",
+    "so the per-platform base-image care that go-service-template's config",
+    "needs does not apply here. What does apply: every dependency bump landing",
+    "here propagates to every service built on the kit the moment they bump",
+    "the kit, so grouping and reviewability matter more than speed.",
+    "",
+    "PLATFORM NOTE: the homelab Renovate instance runs against gitlab.orac.local",
+    "with autodiscover on, so it will open MRs on the GitLab dev remote, not on",
+    "GitHub. GitHub carries the canonical module path, so a merged Renovate MR",
+    "is not visible to consumers until main is pushed to the github remote and",
+    "a new tag is cut. Merging on GitLab alone changes nothing for anyone."
+  ],
+
+  "packageRules": [
+    {
+      "description": [
+        "DO NOT let Renovate touch the go directive. Its gomod manager will",
+        "raise 'go 1.26.0' to whatever patch release is current, and that is a",
+        "build-breaking change here rather than a routine bump: the standard",
+        "golang:1.26 CI image ships some patch of its own, and with",
+        "GOTOOLCHAIN=local a directive newer than the image is a hard failure --",
+        "  go: go.mod requires go >= 1.26.5 (running go 1.26.4)",
+        "which is invisible locally and only fails in CI.",
+        "",
+        "This already shipped once: v0.1.0 was tagged with 'go 1.26.5' and could",
+        "not be built by the homelab pipeline at all. See CHANGELOG 0.1.1.",
+        "",
+        "Go version changes are a deliberate human decision. Raising the",
+        "LANGUAGE version (1.26 -> 1.27) is a compatibility decision that wants",
+        "a human anyway; raising the PATCH is never something this file should",
+        "want. go-service-template's e2e harness has a check that fails on a",
+        "patch-pinned directive; there is no equivalent guard here, so the rule",
+        "below is the only thing holding the line."
+      ],
+      "matchManagers": ["gomod"],
+      "matchDepTypes": ["golang", "toolchain"],
+      "enabled": false
+    },
+    {
+      "description": [
+        "OpenTelemetry moves as a release train: the SDK, the API, the",
+        "exporters and the contrib instrumentation are only tested together, and",
+        "a partial bump produces a module graph that compiles and then fails at",
+        "runtime on a version mismatch. One grouped PR or none.",
+        "",
+        "The kit is where OTel actually lives, so this is the single most",
+        "consequential rule in this file. A bump can also RENAME metrics --",
+        "the semconv import is pinned in exactly one file (obs/obs.go) for this",
+        "reason -- which breaks dashboards downstream. Read the OTel release",
+        "notes before merging, and re-check the metric names recorded in",
+        "obs.RuntimeMetricNames."
+      ],
+      "groupName": "opentelemetry",
+      "matchManagers": ["gomod"],
+      "matchPackageNames": ["go.opentelemetry.io/**"]
+    },
+    {
+      "description": [
+        "huma is the API layer for every service built on this kit, and its",
+        "observable behavior is pinned by tests here (422 rather than 400 for",
+        "validation failures, an absent problem+json 'type' member). Review it",
+        "on its own so a behavior change is not buried in a batch."
+      ],
+      "groupName": "huma",
+      "matchManagers": ["gomod"],
+      "matchPackageNames": ["github.com/danielgtaylor/huma/**"]
+    },
+    {
+      "description": [
+        "GitHub Actions: one grouped PR for the whole workflow set. Low risk",
+        "individually, high noise in aggregate."
+      ],
+      "matchManagers": ["github-actions"],
+      "groupName": "github actions"
+    }
+  ],
+
+  "vulnerabilityAlerts": {
+    "labels": ["security"],
+    "automerge": false
+  }
+}
