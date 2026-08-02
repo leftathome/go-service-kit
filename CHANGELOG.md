@@ -4,6 +4,26 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and this project adheres
 to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.1] - 2026-08-02
+
+### Fixed
+
+- **`go.mod` declared `go 1.26.5`, which the standard `golang:1.26` CI image
+  cannot satisfy.** That image ships Go 1.26.4, and with `GOTOOLCHAIN=local` the
+  build fails outright rather than upgrading:
+  `go: go.mod requires go >= 1.26.5 (running go 1.26.4)`. v0.1.0 was therefore
+  unbuildable in the homelab pipeline. The directive is now `go 1.26.0` -- the
+  language version, not whichever patch release happened to be on the machine
+  that ran `go mod init`.
+
+  Raising `GOTOOLCHAIN` instead would have been the wrong fix: it makes every
+  build download a Go toolchain, and this build path is behind a residential
+  uplink where that is exactly the kind of pull that hangs a pipeline.
+
+  Found by the first real pipeline run of a service generated from
+  go-service-template. No API change; v0.1.0 and v0.1.1 are source-identical
+  apart from the directive.
+
 ## [0.1.0] - 2026-08-01
 
 First release. Six packages, all tested; `go vet`, `go test -race`, and
@@ -78,4 +98,5 @@ Database adapters (per-service; a SQLite adapter must use a pure-Go driver such
 as `modernc.org/sqlite` to stay CGO-free), authentication middleware beyond a
 reserved slot, and an MCP surface.
 
+[0.1.1]: https://github.com/leftathome/go-service-kit/releases/tag/v0.1.1
 [0.1.0]: https://github.com/leftathome/go-service-kit/releases/tag/v0.1.0
