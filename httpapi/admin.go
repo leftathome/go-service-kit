@@ -199,6 +199,15 @@ func (a *Admin) Handlers() map[string]http.Handler {
 // finds out at startup instead of serving two different answers depending on
 // registration order.
 //
+// ONE HAZARD, worth knowing before the migration outlives its deadline:
+// [Options.Middleware] is the reserved auth slot and it wraps EVERYTHING on
+// the API listener, including anything mounted here. Add a bearer-token check
+// there while the admin routes are still on that port and the kubelet's own
+// probes start getting 401s -- the liveness probe fails, and the container is
+// killed. The admin listener has no such slot, which is part of why the routes
+// belong there. Either finish the migration before adding auth, or exempt
+// [AdminPaths] in the middleware itself.
+//
 // READ THE PACKAGE DOC FIRST. Single-port mode is a migration affordance with a
 // deadline, not a supported end state: /metrics, pprof and the OpenAPI document
 // belong off any listener that could end up behind an Ingress.
