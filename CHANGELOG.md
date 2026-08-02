@@ -7,8 +7,9 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 Ergonomic gaps found by nagus, the kit's first real consumer, while planning
-its migration. Everything below is additive: v0.1.2 code keeps compiling and
-keeps behaving the same way.
+its migration. Everything below is additive at the API level: v0.1.2 code keeps
+compiling. There is exactly one behaviour change -- `obs.DefaultRedactKeys` --
+and it has its own section.
 
 ### Added
 
@@ -72,6 +73,104 @@ keeps behaving the same way.
   missing operation; `RunClauses` fails on one, because a clause you asked for
   by name and silently did not run is worse than one you never asked for.
 
+- **`config`: `float64` and friends in `Load[T]`.** A HARD BLOCKER, not an
+  ergonomic one: nagus could not adopt the package at all, because
+  `NAGUS_MIN_CAPACITY` and `NAGUS_LAND_{MIN,MAX}_ACREAGE` are fractional. Any
+  service with a threshold, a ratio or a unit measurement hits it. Now
+  supported: `float32`/`float64`, the remaining signed widths, all unsigned
+  widths, `time.Time` as RFC 3339, and slices of any supported scalar
+  (`[]int`, `[]float64`, `[]time.Duration`).
+
+  **NaN and the infinities are refused.** They parse cleanly in `strconv` and
+  then make every comparison against them false: a NaN minimum capacity matches
+  nothing while the service reports healthy.
+
+  `[]byte` and `[][]T` stay unsupported deliberately -- `[]byte` is `[]uint8`,
+  which the numeric path would read as a list of small integers -- as do maps,
+  for which no obvious textual form exists. Slice element errors report the
+  INDEX, never the element text, so a credential-named variable's redaction
+  still holds. Fixed in passing: a named string-slice type (`type Hosts
+  []string`) panicked in `reflect.Value.Set`.
+
+- **`outbound`: three shapes over one policy.** `*outbound.Client` was not an
+  `*http.Client`, did not implement `http.RoundTripper`, and the package
+  exported no interface to type a field as -- so adopting it meant editing all
+  six of nagus's integrations, and any integration that skipped the edit kept
+  `http.DefaultClient` with no timeout at all.
+
+  `Doer` is the one-method interface both `*http.Client` and `*outbound.Client`
+  satisfy. `NewTransport` returns the whole policy as an `http.RoundTripper`
+  (`hc.Transport = tr`). `NewHTTPClient` returns a configured `*http.Client`.
+  `(*Client).Transport()` and `(*Client).HTTPClient()` hand out the other two
+  shapes backed by the SAME limiter and budget, so call sites can be converted
+  one at a time without running two quotas against one remote.
+
+  **The security properties hold on every path**, which took work, because a
+  RoundTripper sits below the layer that normally provides two of them. The
+  per-attempt timeout is a context deadline whose cancel is deferred to the
+  response body's `Close`, giving the same headers-and-body coverage
+  `http.Client.Timeout` does. Redirect hygiene is applied by the transport
+  itself, detecting a redirect follow through `Request.Response`, so the
+  cross-origin auth-header strip and the `MaxRedirects` cap survive being
+  attached to a bare `&http.Client{}` -- whose own policy forwards `X-Api-Key`
+  across hosts and caps hops at 10. Tested that way, deliberately.
+
+- **`outbound`: windowed, resettable, server-reportable call budgets.**
+  `CallBudget` was a process-lifetime `atomic.Int64`. Real quotas are windowed
+  (eBay Browse: ~5,000 calls per UTC DAY, not per 24h of pod uptime) and are
+  often reported by the server, so nagus could not retire its own budget code
+  in favour of the kit's -- the very code this package's doc cites as its
+  precedent.
+
+  New: the `Budget` interface (`Reserve`/`Observe`/`Reset`/`Stats`),
+  `WindowedBudget`, `BudgetConfig`, `BudgetStats`, `Config.Budget`,
+  `(*Client).Budget()` and `(*Client).BudgetRemaining()` -- the last filling a
+  gap where the remaining count was observable only as a side effect on
+  `CallEvent`. A rolling window TUMBLES from its original start, so a poller
+  waking every 61 minutes on an hourly budget does not drift. `Calendar: true`
+  aligns to UTC boundaries, which at 24h is exactly "per UTC day".
+  `Observe(remaining)` is authoritative DOWNWARD only: a generous server report
+  never widens a ceiling the service chose, and a negative one means none left.
+  `Config.CallBudget` is unchanged and is now defined as
+  `BudgetConfig{Limit: N}` with no window.
+
+- **`obs`: the `outbound.Metrics` bridge.** `outbound.Metrics` was documented as
+  "the seam the observability package wires into" and `obs` shipped no
+  implementation, so every service was going to hand-roll one and pick
+  different names. `OutboundMetrics(meter)` and `(*Providers).OutboundMetrics()`
+  build it; `OutboundMetricNames` records the family names the way
+  `RuntimeMetricNames` already does:
+  `outbound_calls_total{host,method,status}`,
+  `outbound_call_duration_seconds`, `outbound_limiter_delay_seconds{host}`,
+  `outbound_budget_remaining{host}`. `status="0"` is a transport failure rather
+  than an HTTP status. The import direction is `obs -> outbound`, never the
+  reverse.
+
+- **`obs`: subtractive redaction.** `CredentialRedactKeys`, `PIIRedactKeys` and
+  `RequestMaterialRedactKeys` are the three parts `DefaultRedactKeys` is now
+  composed from, and `RedactKeysExcept(...)` returns a copy with named keys
+  removed. It PANICS if asked to uncover a credential key: that is a
+  programming error detectable only at the call, and a process that started
+  anyway would log credentials for as long as it ran. A service with a
+  genuinely narrower need composes one from the three parts instead.
+
+### Changed
+
+- **`obs.DefaultRedactKeys` no longer redacts `query`, `search`, `lat` or
+  `lon`.** This is a BEHAVIOUR CHANGE. Those are domain vocabulary, not
+  credentials: nagus is an acquisition service where `query` is the operator's
+  own eBay source configuration and lat/lon are the entire subject of its land
+  category, so the fleet default turned every useful debug line into a hash
+  while adding nothing to safety. `query_string`, `url.query`, `raw_url` and the
+  new `raw_query` stay in, because credentials routinely ride in a raw query
+  string -- it is the bare domain words that left. `client_secret`,
+  `signature`, `ssn` and `date_of_birth` were added while revisiting the list.
+
+  **A service relying on the default to mask a field named exactly `query`,
+  `search`, `lat` or `lon` must now name it**, e.g.
+  `append(slices.Clone(obs.DefaultRedactKeys), "query")`. Nothing stops
+  compiling.
+
 ### Documented
 
 - **`lifecycle`: the propagation delay is pure downtime under `replicas: 1` +
@@ -89,6 +188,32 @@ keeps behaving the same way.
 - **`storekit`: how to adopt a SUBSET of the contract**, and why a store with a
   richer read path than `List` should not bend a live query to produce the total
   order the pagination clauses require.
+
+- **`obs`: how to preserve an existing metric family name across a migration.**
+  `Providers.PromRegistry` was the right escape hatch and nothing said WHEN to
+  use it. A service porting an existing `/metrics` cannot re-express its
+  metrics as OTel instruments: the pinned `UnderscoreEscapingWithSuffixes`
+  strategy escapes dots and appends `_total` and unit suffixes, so the old
+  series goes stale, the renamed one starts at zero, and every alert written
+  against the old name evaluates to nothing without erroring -- nobody notices
+  until the alert that should have fired does not. The package doc now carries
+  the exact translation rules, the native `prometheus.Collector` recipe, the
+  advice to collect at SCRAPE TIME for a derived value, and the
+  `testutil.CollectAndCompare` gate. It is verified rather than asserted: a
+  test registers a native collector and an OTel counter of the same name and
+  proves the first keeps its name while the second is renamed. nagus must keep
+  `nagus_ebay_api_calls_*` across its migration or lose the only operational
+  signal it has, and working this out required reading `newMeterProvider`.
+
+- **`obs`: the deny list is a fleet DEFAULT, not a fleet law.** The logging
+  hygiene section now says so, and points at `RedactKeysExcept` and the three
+  component lists, with the standing instruction to write the reason for any
+  removal at the call site.
+
+- **`outbound`: the terms-of-service example now uses a calendar budget** and
+  `MaxAttempts: 1`, because a metered API is the wrong place for a silent retry
+  -- the quota is charged per attempt, not per logical call -- and shows
+  feeding `X-RateLimit-Remaining` back through `Observe`.
 
 ## [0.1.2] - 2026-08-02
 
