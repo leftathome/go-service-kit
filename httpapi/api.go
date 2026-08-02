@@ -46,14 +46,79 @@
 //	    Flush:     obsp.Shutdown,
 //	})
 //
-// # Server hardening is not configurable
+// # Single-port mode is a MIGRATION AFFORDANCE, not an equal option
+//
+// [AdminHandlers] and [Admin.RegisterOn] will mount the admin routes on an
+// existing mux, including the API listener's. That exists for ONE reason: a
+// live service cannot always do a hard cutover.
+//
+// Consider the deployment nagus actually runs -- replicas: 1, strategy:
+// Recreate, everything on :8080 today. Splitting the listeners means the chart
+// moves all three probes to :9090 in the same release that the binary starts
+// listening there, and chart and image become an atomic pair forever after.
+// The deploy is survivable. The ROLLBACK is what kills you: reverting the image
+// "to get back to a known-good binary" while leaving the new chart in place
+// gives you a pod that does not listen on :9090, probed on :9090, killed by
+// liveness -- and under Recreate the old pod is already gone. That is a full
+// outage produced by the recovery action.
+//
+// The transition path removes the pairing. Serve the admin routes on BOTH ports
+// for one release, move the chart's probes and the ServiceMonitor to the admin
+// port in the next, then drop the API-port copies in a third. Every step is
+// independently revertible because no release requires the other side to move
+// with it.
+//
+//	admin := httpapi.NewAdmin(httpapi.AdminOptions{Addr: ":9090", ...})
+//	admin.RegisterOn(api.Mux)   // TRANSITIONAL: remove once probes are on :9090
+//	// and exclude them from this listener's RED metrics while they are here:
+//	//   httpapi.Options{InstrumentationFilter: httpapi.ExceptAdminPaths}
+//
+// TWO LISTENERS REMAIN THE DESTINATION. The reason is at the top of this doc
+// and it does not weaken for a migrating service: /metrics is a live inventory
+// of what the process does, /debug/pprof will hand out heap dumps, and the
+// OpenAPI document is a machine-readable map of every route and type the
+// service accepts. The API port is the only one that is ever a candidate for an
+// Ingress, so anything left on it is one mistaken Ingress away from being
+// public. A service that stops after the first step has taken on the debt
+// permanently and should say so in a bead.
+//
+// # Non-REST surfaces on the public listener
+//
+// Not every consumer-facing endpoint can be a huma operation. The fleet case is
+// MCP: a single POST whose behaviour is dispatched by a "method" member in a
+// polymorphic JSON-RPC 2.0 body. OpenAPI cannot describe that usefully, and a
+// JSON-RPC error is not problem+json.
+//
+// The supported pattern is [API.RawRoute], which is a thin, greppable wrapper
+// over API.Mux:
+//
+//	api.RawRoute("POST /mcp", mcpHandler)
+//
+// A raw route gets everything the listener provides except the OpenAPI
+// document: the hardened server, otelhttp tracing, and RED metrics with
+// http_route set to the pattern, so /mcp appears in the same dashboards as
+// every huma operation.
+//
+// THE HONEST CAVEAT. A raw route is an EXCEPTION to this package's
+// one-error-format-per-listener rule. [WriteProblem] emits RFC 9457
+// problem+json and every huma operation does the same, but a JSON-RPC endpoint
+// MUST answer with a JSON-RPC error object or its clients break. So a listener
+// carrying both has two error formats on it, and a client cannot infer which
+// one it will get from the status code alone -- it has to know the route. That
+// is a real cost and the reason raw routes are named rather than ambient. Keep
+// it bounded: the format is per ROUTE and each raw route documents its own, the
+// rest of the listener stays problem+json, and a route that COULD be a huma
+// operation should be one. [API.RawRoutes] lists what a service has opted out
+// of, so a test can assert the set has not grown by accident.
+//
+// # Server hardening is configurable, but never absent
 //
 // Both constructors set ReadHeaderTimeout (gosec G112), ReadTimeout,
-// WriteTimeout, IdleTimeout, and MaxHeaderBytes. There is no Options field for
-// any of them, so a timeout-less server is UNCONSTRUCTABLE through this
-// package's public API. Anything a service would plausibly want to vary is an
-// Options field with a working default; anything security-relevant is not a
-// field at all.
+// WriteTimeout, IdleTimeout, and MaxHeaderBytes. [Options.Timeouts] tunes them
+// -- a fan-out read that legitimately exceeds 30s otherwise gets a TRUNCATED
+// body rather than an error -- but zero means the documented default and a
+// negative value is rejected, so a timeout-less server stays UNCONSTRUCTABLE
+// through this package's public API. See [Timeouts] for the full tension.
 //
 // # huma stops here
 //
@@ -67,7 +132,10 @@ package httpapi
 import (
 	"log/slog"
 	"net/http"
-	"time"
+	"slices"
+	"strconv"
+	"strings"
+	"sync"
 
 	"github.com/danielgtaylor/huma/v2"
 	"github.com/danielgtaylor/huma/v2/adapters/humago"
@@ -81,35 +149,6 @@ import (
 const (
 	DefaultAddr      = ":8080"
 	DefaultAdminAddr = ":9090"
-)
-
-// Server timeouts. Not Options fields, by design -- see the package doc.
-//
-// The numbers assume a JSON API behind a cluster-local Service. A service that
-// streams responses or accepts large uploads needs different ones and should
-// say so in a bead rather than growing a knob here that every other service
-// then has to reason about.
-const (
-	// readHeaderTimeout is the gosec G112 mitigation: the budget for a client
-	// to finish sending request headers. A Slowloris client sends one header
-	// byte per interval forever; this is what stops it holding a connection.
-	readHeaderTimeout = 5 * time.Second
-
-	// readTimeout covers headers plus body.
-	readTimeout = 30 * time.Second
-
-	// writeTimeout is measured from the end of the request headers, so it
-	// bounds handler time plus response write.
-	writeTimeout = 30 * time.Second
-
-	// idleTimeout is how long a keep-alive connection may sit unused. Longer
-	// than a typical scrape interval so scrapers reuse connections.
-	idleTimeout = 120 * time.Second
-
-	// maxHeaderBytes bounds header memory per connection. This is the stdlib
-	// default value, set EXPLICITLY so that the guarantee is in the code
-	// rather than in a default that could change.
-	maxHeaderBytes = 1 << 20
 )
 
 // RED metric names as they appear on /metrics, produced by otelhttp
@@ -188,6 +227,23 @@ type Options struct {
 	// slog.Default().
 	Logger *slog.Logger
 
+	// Timeouts tunes the server budgets. The zero value yields the documented
+	// defaults; see [Timeouts] before changing any of them, and in particular
+	// before raising WriteTimeout for a slow read.
+	Timeouts Timeouts
+
+	// InstrumentationFilter selects which requests the otelhttp middleware
+	// observes. It is called with the request BEFORE the mux routes it;
+	// returning false means the request is neither traced nor counted in the
+	// RED metrics. Nil observes everything, which is the right default.
+	//
+	// The reason it exists is the transitional single-port mode: admin routes
+	// mounted on this listener would otherwise put every Prometheus scrape and
+	// every kubelet probe into the RED series, which is a permanent baseline of
+	// self-referential fake traffic on every dashboard -- exactly what the
+	// listener split avoids. Pass [ExceptAdminPaths] while they are here.
+	InstrumentationFilter func(*http.Request) bool
+
 	// Middleware is the RESERVED AUTH SLOT. Handlers are applied outermost
 	// first, wrapping everything on this listener including /docs and the
 	// spec endpoints. Adding a bearer-token check later is a wiring change
@@ -226,8 +282,64 @@ type API struct {
 	// Mux is the underlying router, for the rare hand-written handler that
 	// cannot be a huma operation (a webhook receiver with a non-JSON body, for
 	// instance). Anything registered here is absent from the OpenAPI document,
-	// so prefer huma.
+	// so prefer huma, and prefer [API.RawRoute] over touching this directly:
+	// it records the pattern so [API.RawRoutes] can report it.
 	Mux *http.ServeMux
+
+	mu        sync.Mutex
+	rawRoutes []string
+}
+
+// RawRoute registers a handler that cannot be a huma operation -- an MCP
+// endpoint, a webhook receiver with a non-JSON body, a legacy JSON shape a
+// consumer parses field by field. See "Non-REST surfaces on the public
+// listener" in the package doc for the trade, which includes an explicit
+// exception to the one-error-format-per-listener rule.
+//
+// pattern is a [http.ServeMux] pattern and MUST be method-qualified
+// ("POST /mcp", not "/mcp"): an unqualified pattern answers every method, so a
+// GET from a browser or a crawler reaches a handler written for one verb. A
+// route that legitimately serves several methods registers each one. RawRoute
+// panics on an unqualified pattern, on an empty pattern, and on a nil handler,
+// because all three are wiring bugs that are silent at runtime.
+//
+// The handler is otherwise exactly as if registered on API.Mux: instrumented,
+// traced, and absent from the OpenAPI document.
+func (a *API) RawRoute(pattern string, h http.Handler) {
+	if h == nil {
+		panic("httpapi: RawRoute " + pattern + " has a nil handler")
+	}
+	method, rest, ok := strings.Cut(pattern, " ")
+	if !ok || method == "" || strings.TrimSpace(rest) == "" || strings.HasPrefix(pattern, "/") {
+		panic("httpapi: RawRoute pattern " + strconv.Quote(pattern) +
+			` must be method-qualified, e.g. "POST /mcp"`)
+	}
+
+	a.mu.Lock()
+	a.rawRoutes = append(a.rawRoutes, pattern)
+	slices.Sort(a.rawRoutes)
+	a.mu.Unlock()
+
+	a.Mux.Handle(pattern, h)
+}
+
+// RawRouteFunc is [API.RawRoute] for a plain handler function.
+func (a *API) RawRouteFunc(pattern string, h func(http.ResponseWriter, *http.Request)) {
+	if h == nil {
+		panic("httpapi: RawRouteFunc " + pattern + " has a nil handler")
+	}
+	a.RawRoute(pattern, http.HandlerFunc(h))
+}
+
+// RawRoutes returns the patterns registered through [API.RawRoute], sorted.
+//
+// This is the listener's opt-out list: everything here is absent from the
+// OpenAPI document and may answer with an error format other than problem+json.
+// Assert on it in a test, so that set only ever grows deliberately.
+func (a *API) RawRoutes() []string {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return slices.Clone(a.rawRoutes)
 }
 
 // New builds the public listener. Register operations on the returned
@@ -284,12 +396,14 @@ func New(opts Options) *API {
 	// Options.Middleware for why user middleware goes outside it. A nil
 	// provider is ignored by these options, which falls back to the OTel
 	// globals that obs.Setup installs.
-	instrumented := otelhttp.NewHandler(
-		mux,
-		"http.server",
+	otelOpts := []otelhttp.Option{
 		otelhttp.WithTracerProvider(opts.TracerProvider),
 		otelhttp.WithMeterProvider(opts.MeterProvider),
-	)
+	}
+	if opts.InstrumentationFilter != nil {
+		otelOpts = append(otelOpts, otelhttp.WithFilter(otelhttp.Filter(opts.InstrumentationFilter)))
+	}
+	instrumented := otelhttp.NewHandler(mux, "http.server", otelOpts...)
 
 	handler := instrumented
 	for i := len(opts.Middleware) - 1; i >= 0; i-- {
@@ -300,7 +414,7 @@ func New(opts Options) *API {
 	}
 
 	return &API{
-		Server: newServer(addr, handler, opts.Logger),
+		Server: newServer(addr, handler, opts.Logger, opts.Timeouts),
 		Huma:   humaAPI,
 		Mux:    mux,
 	}
@@ -309,22 +423,3 @@ func New(opts Options) *API {
 // Handler returns the fully wrapped handler the server serves. Useful in tests
 // that drive the listener through httptest without binding a port.
 func (a *API) Handler() http.Handler { return a.Server.Handler }
-
-// newServer is the ONLY place an http.Server is constructed in this package,
-// which is what makes "a timeout-less server is unconstructable" a property of
-// the code rather than a habit.
-func newServer(addr string, h http.Handler, logger *slog.Logger) *http.Server {
-	if logger == nil {
-		logger = slog.Default()
-	}
-	return &http.Server{
-		Addr:              addr,
-		Handler:           h,
-		ReadHeaderTimeout: readHeaderTimeout,
-		ReadTimeout:       readTimeout,
-		WriteTimeout:      writeTimeout,
-		IdleTimeout:       idleTimeout,
-		MaxHeaderBytes:    maxHeaderBytes,
-		ErrorLog:          slog.NewLogLogger(logger.Handler(), slog.LevelWarn),
-	}
-}

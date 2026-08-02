@@ -23,6 +23,14 @@ import (
 // than imported from obs: the kit's packages have no edges between siblings.
 func newMetricsAPI(t *testing.T) (*httpapi.API, *prometheus.Registry) {
 	t.Helper()
+	return newMetricsAPIWithOptions(t, httpapi.Options{})
+}
+
+// newMetricsAPIWithOptions is newMetricsAPI for a test that has to vary the
+// listener's configuration -- the transition tests set an
+// InstrumentationFilter. opts.MeterProvider is always overwritten.
+func newMetricsAPIWithOptions(t *testing.T, opts httpapi.Options) (*httpapi.API, *prometheus.Registry) {
+	t.Helper()
 
 	reg := prometheus.NewRegistry()
 	exp, err := otelprom.New(
@@ -35,7 +43,8 @@ func newMetricsAPI(t *testing.T) (*httpapi.API, *prometheus.Registry) {
 	mp := sdkmetric.NewMeterProvider(sdkmetric.WithReader(exp))
 	t.Cleanup(func() { _ = mp.Shutdown(context.Background()) })
 
-	api := httpapi.New(httpapi.Options{MeterProvider: mp})
+	opts.MeterProvider = mp
+	api := httpapi.New(opts)
 	huma.Register(api.Huma, huma.Operation{
 		OperationID: "get-thing",
 		Method:      http.MethodGet,

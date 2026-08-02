@@ -90,7 +90,9 @@ func do(t *testing.T, h http.Handler, method, target string) *httptest.ResponseR
 
 // gosec G112 and its neighbours. Every timeout must be non-zero on both
 // listeners, and there must be no public path that yields a server without
-// them: Options carries no timeout fields at all.
+// them. The budgets became tunable through Options.Timeouts, but the invariant
+// did not move: zero there means the DEFAULT and a negative value is rejected.
+// See timeouts_test.go.
 func TestServersAlwaysHaveTimeouts(t *testing.T) {
 	t.Parallel()
 
@@ -117,20 +119,30 @@ func TestServersAlwaysHaveTimeouts(t *testing.T) {
 	}
 }
 
-// The hardening above is only durable if a caller cannot opt out of it. Assert
-// the shape of the Options structs, not just the constructed value.
-func TestOptionsExposeNoTimeoutKnobs(t *testing.T) {
+// The hardening above is only durable if a caller cannot opt out of it. The
+// budgets are now tunable, so the shape assertion is that the ONLY way to reach
+// them is the Timeouts struct, whose contract is "zero means the default". A
+// bare `WriteTimeout time.Duration` on Options would carry net/http's contract
+// instead -- zero means unbounded -- and one forgotten field would silently
+// undo the whole thing.
+func TestTimeoutKnobsOnlyExistAsATimeoutsField(t *testing.T) {
 	t.Parallel()
 
+	timeoutsType := reflect.TypeOf(httpapi.Timeouts{})
 	for _, typ := range []reflect.Type{
 		reflect.TypeOf(httpapi.Options{}),
 		reflect.TypeOf(httpapi.AdminOptions{}),
 	} {
 		for i := range typ.NumField() {
-			name := typ.Field(i).Name
-			if strings.Contains(strings.ToLower(name), "timeout") ||
-				strings.Contains(strings.ToLower(name), "maxheader") {
-				t.Errorf("%s.%s: server timeouts are not configurable by design", typ.Name(), name)
+			f := typ.Field(i)
+			lower := strings.ToLower(f.Name)
+			if !strings.Contains(lower, "timeout") && !strings.Contains(lower, "maxheader") {
+				continue
+			}
+			if f.Name != "Timeouts" || f.Type != timeoutsType {
+				t.Errorf("%s.%s (%s): server budgets are reachable only through the Timeouts struct, "+
+					"whose zero value means the default rather than net/http's \"no timeout\"",
+					typ.Name(), f.Name, f.Type)
 			}
 		}
 	}
