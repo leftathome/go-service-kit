@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"os"
 	"slices"
+	"strconv"
 	"strings"
 
 	"go.opentelemetry.io/otel/trace"
@@ -34,49 +35,128 @@ type LoggerOptions struct {
 	AddSource bool
 }
 
-// DefaultRedactKeys is the deny list applied when LoggerOptions.RedactKeys is
-// nil. It covers credentials plus the three categories the logging-hygiene
-// rule names: request bodies, query strings, and user-supplied fields.
+// The deny list is published in three parts so a service can compose the
+// policy it actually needs instead of choosing between "all of it" and "none of
+// it". [DefaultRedactKeys] is the three concatenated, and remains what
+// LoggerOptions.RedactKeys nil means.
 //
-// Extend it, do not replace it:
+// Treat all four as READ-ONLY. They are slices, so a caller could append into
+// spare capacity and change what every other logger in the process redacts;
+// build a new slice instead ([RedactKeysExcept], slices.Concat, append to a
+// clone).
+var (
+	// CredentialRedactKeys are keys whose values are secrets or session
+	// material. These are not tunable per service: a credential in Loki is an
+	// incident in every domain, so [RedactKeysExcept] refuses to remove them.
+	CredentialRedactKeys = []string{
+		"authorization",
+		"proxy-authorization",
+		"cookie",
+		"set-cookie",
+		"credential",
+		"password",
+		"passwd",
+		"secret",
+		"client_secret",
+		"token",
+		"access_token",
+		"refresh_token",
+		"id_token",
+		"api_key",
+		"apikey",
+		"private_key",
+		"signature",
+		"session",
+		"session_id",
+	}
+
+	// PIIRedactKeys are keys that carry personal data about a human. Genuine
+	// PII, not domain vocabulary that happens to describe people.
+	PIIRedactKeys = []string{
+		"email",
+		"phone",
+		"address",
+		"postal_code",
+		"ssn",
+		"date_of_birth",
+	}
+
+	// RequestMaterialRedactKeys are keys that echo a request back verbatim. A
+	// URL query STRING is included because credentials routinely ride in one;
+	// the word "query" on its own is not, because in a search service it is
+	// the subject of every useful log line.
+	RequestMaterialRedactKeys = []string{
+		"body",
+		"request_body",
+		"response_body",
+		"payload",
+		"query_string",
+		"url.query",
+		"raw_url",
+		"raw_query",
+	}
+
+	// DefaultRedactKeys is the deny list applied when LoggerOptions.RedactKeys
+	// is nil: credentials, PII, and raw request material.
+	//
+	// Extend it rather than replacing it:
+	//
+	//	RedactKeys: append(slices.Clone(obs.DefaultRedactKeys), "serial_number")
+	//
+	// To take something OUT, use [RedactKeysExcept] -- and read its doc first,
+	// because doing so is a deliberate act with a reason worth writing down.
+	DefaultRedactKeys = slices.Concat(CredentialRedactKeys, PIIRedactKeys, RequestMaterialRedactKeys)
+)
+
+// RedactKeysExcept returns a fresh copy of [DefaultRedactKeys] with the named
+// keys removed, matched case-insensitively. Names that are not in the list are
+// ignored, so the call does not have to track the kit's exact contents.
 //
-//	RedactKeys: append(obs.DefaultRedactKeys, "serial_number", "purchase_price")
-var DefaultRedactKeys = []string{
-	// Credentials and session material.
-	"authorization",
-	"proxy-authorization",
-	"cookie",
-	"set-cookie",
-	"credential",
-	"password",
-	"passwd",
-	"secret",
-	"token",
-	"access_token",
-	"refresh_token",
-	"id_token",
-	"api_key",
-	"apikey",
-	"private_key",
-	"session",
-	"session_id",
-	// Request material that echoes user input back verbatim.
-	"body",
-	"request_body",
-	"response_body",
-	"payload",
-	"query",
-	"query_string",
-	"url.query",
-	"raw_url",
-	"search",
-	// User-supplied identity and location.
-	"email",
-	"phone",
-	"address",
-	"postal_code",
-	"lat",
-	"lon",
+// CHANGING THE DENY LIST IS A DELIBERATE ACT. The list is a fleet default, and
+// the default is chosen to be wrong in the safe direction. Removing a key means
+// asserting that in THIS service, under THIS key, the value is operator-authored
+// configuration or a bounded identifier -- not user data, not third-party
+// content, not a credential. Write the reason at the call site; the next person
+// to read it will be trying to work out whether it is still true.
+//
+// nagus is the worked example and the reason this function exists. It is an
+// acquisition service: "query" is the operator's own eBay search string and
+// "lat"/"lon" are the whole subject of its land category, so redacting them
+// turned every useful debug line into a hash. Its previous options were to
+// replace the list wholesale (and silently lose a credential key on the next
+// kit upgrade) or to disable redaction entirely.
+//
+//	// A source's query and a parcel's coordinates are operator-authored
+//	// configuration in this service, not user data. Listing free text stays
+//	// redacted and never appears above debug level.
+//	RedactKeys: obs.RedactKeysExcept("query", "search", "lat", "lon")
+//
+// It PANICS if asked to remove a key from [CredentialRedactKeys]. That is a
+// programming error, it is detectable only at the moment of the call, and a
+// process that starts anyway would log credentials for as long as it ran. A
+// service with a genuine need for a narrower list can still build one from the
+// three exported components; the panic guards the convenience path, it is not
+// a wall.
+func RedactKeysExcept(keys ...string) []string {
+	drop := make(map[string]struct{}, len(keys))
+	for _, k := range keys {
+		k = strings.ToLower(strings.TrimSpace(k))
+		if k == "" {
+			continue
+		}
+		if slices.Contains(CredentialRedactKeys, k) {
+			panic("obs: RedactKeysExcept cannot remove the credential key " + strconv.Quote(k) +
+				"; credential redaction is not service-tunable")
+		}
+		drop[k] = struct{}{}
+	}
+	out := make([]string, 0, len(DefaultRedactKeys))
+	for _, k := range DefaultRedactKeys {
+		if _, bad := drop[strings.ToLower(k)]; !bad {
+			out = append(out, k)
+		}
+	}
+	return out
 }
 
 const redactedPrefix = "[redacted:"

@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"log/slog"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -203,13 +204,14 @@ func TestLoggerRedactsDefaultSensitiveKeys(t *testing.T) {
 	// nil RedactKeys means DefaultRedactKeys, so the safe path is the default.
 	NewLogger(LoggerOptions{Level: slog.LevelDebug, Output: buf}).Info("req",
 		"authorization", "Bearer sekrit-token",
-		"query", "q=vintage+turntable",
+		"query_string", "q=vintage+turntable&api_key=abcd",
 		"password", "hunter2",
+		"email", "someone@example.com",
 		"route", "/widgets/{id}",
 	)
 
 	out := buf.String()
-	for _, leaked := range []string{"sekrit-token", "vintage", "hunter2"} {
+	for _, leaked := range []string{"sekrit-token", "vintage", "hunter2", "someone@example.com"} {
 		if strings.Contains(out, leaked) {
 			t.Errorf("sensitive value %q reached the log output: %s", leaked, out)
 		}
@@ -220,6 +222,93 @@ func TestLoggerRedactsDefaultSensitiveKeys(t *testing.T) {
 	}
 	if s, _ := rec["password"].(string); !strings.HasPrefix(s, "[redacted:") {
 		t.Errorf("password = %v, want a redaction token", rec["password"])
+	}
+}
+
+// The default list covers credentials, PII and raw request material. It does
+// NOT cover domain vocabulary: "query", "search", "lat" and "lon" are the
+// subject matter of an acquisition or search service, and redacting them by
+// default turned every useful line in nagus into a hash while adding nothing
+// to safety. A service that DOES want them masked says so explicitly.
+func TestDefaultRedactKeysAvoidDomainVocabulary(t *testing.T) {
+	t.Parallel()
+	for _, k := range []string{"query", "search", "lat", "lon", "title", "name", "sku"} {
+		if slices.Contains(DefaultRedactKeys, k) {
+			t.Errorf("DefaultRedactKeys contains the domain word %q", k)
+		}
+	}
+	for _, k := range []string{"authorization", "password", "api_key", "token", "email", "query_string"} {
+		if !slices.Contains(DefaultRedactKeys, k) {
+			t.Errorf("DefaultRedactKeys is missing %q", k)
+		}
+	}
+	// The parts must compose into the whole, so a caller can build from either.
+	want := slices.Concat(CredentialRedactKeys, PIIRedactKeys, RequestMaterialRedactKeys)
+	if !slices.Equal(DefaultRedactKeys, want) {
+		t.Error("DefaultRedactKeys is not the concatenation of its three parts")
+	}
+}
+
+func TestRedactKeysExceptRemovesOnlyWhatIsNamed(t *testing.T) {
+	t.Parallel()
+	got := RedactKeysExcept("Email", " postal_code ", "not_in_the_list")
+	for _, gone := range []string{"email", "postal_code"} {
+		if slices.Contains(got, gone) {
+			t.Errorf("%q survived RedactKeysExcept", gone)
+		}
+	}
+	for _, kept := range []string{"authorization", "password", "body", "phone"} {
+		if !slices.Contains(got, kept) {
+			t.Errorf("%q was dropped and should not have been", kept)
+		}
+	}
+	if len(got) != len(DefaultRedactKeys)-2 {
+		t.Fatalf("removed %d keys, want exactly 2", len(DefaultRedactKeys)-len(got))
+	}
+	// The caller gets a copy: writing to it must not change the fleet default.
+	before := slices.Clone(DefaultRedactKeys)
+	got[0] = "clobbered"
+	if !slices.Equal(DefaultRedactKeys, before) {
+		t.Error("RedactKeysExcept returned a view into DefaultRedactKeys")
+	}
+}
+
+func TestRedactKeysExceptRefusesToUncoverACredential(t *testing.T) {
+	t.Parallel()
+	for _, k := range []string{"authorization", "API_KEY", "token"} {
+		func() {
+			defer func() {
+				if recover() == nil {
+					t.Errorf("RedactKeysExcept(%q) did not panic; a credential key is not service-tunable", k)
+				}
+			}()
+			_ = RedactKeysExcept(k)
+		}()
+	}
+}
+
+// The nagus case, end to end: an unlisted domain key logs in the clear, a key
+// the service explicitly excepted logs in the clear, and a credential does not.
+func TestRedactKeysExceptComposesAWorkingLogger(t *testing.T) {
+	buf := newSyncBuffer()
+	NewLogger(LoggerOptions{
+		Output:     buf,
+		RedactKeys: RedactKeysExcept("email"),
+	}).Info("source",
+		"query", "hdd 18tb",
+		"email", "someone@example.com",
+		"api_key", "sekrit",
+	)
+
+	out := buf.String()
+	if !strings.Contains(out, "hdd 18tb") {
+		t.Errorf("an unlisted domain key was redacted: %s", out)
+	}
+	if !strings.Contains(out, "someone@example.com") {
+		t.Errorf("the explicitly excepted key was still redacted: %s", out)
+	}
+	if strings.Contains(out, "sekrit") {
+		t.Errorf("a credential leaked: %s", out)
 	}
 }
 

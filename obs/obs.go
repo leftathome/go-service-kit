@@ -31,6 +31,57 @@
 // is registered too, so "which version is actually running" is answerable from
 // Prometheus across a rollback.
 //
+// For egress, [OutboundMetrics] bridges outbound.CallEvent onto instruments
+// with fixed, documented names, so every service in the fleet reports its
+// outbound traffic the same way instead of hand-rolling an adapter each.
+//
+// # Preserving an existing metric family name across a migration
+//
+// READ THIS BEFORE PORTING AN EXISTING /metrics ENDPOINT.
+//
+// [Providers.Meter] does NOT export the name you give an instrument. The
+// Prometheus exporter is pinned to the UnderscoreEscapingWithSuffixes
+// translation strategy, which rewrites every instrument name on the way out:
+//
+//	svc.thing.count  (dots)                 -> svc_thing_count
+//	an Int64Counter                         -> gains a _total suffix
+//	unit "s"                                -> gains a _seconds suffix
+//	unit "By"                               -> gains a _bytes suffix
+//	unit "{call}", "{thread}" (annotations) -> no suffix
+//
+// For a NEW metric that is fine and the translation is the house convention.
+// For a metric Prometheus has ALREADY RECORDED it is a silent data loss: the
+// old series goes stale, the renamed one starts from zero, and every dashboard
+// and alert written against the old name keeps evaluating to nothing without
+// erroring. Nobody notices until the alert that should have fired does not.
+//
+// The escape hatch is [Providers.PromRegistry]. It is a plain
+// *prometheus.Registry, so a native prometheus.Collector registered on it keeps
+// its family name verbatim, alongside everything OTel exports:
+//
+//	// Names, HELP text and label set MUST match what Prometheus already has.
+//	// A native collector rather than an OTel instrument, because the
+//	// translator would rename this to nagus_ebay_api_calls_budget_total and
+//	// orphan four years of recorded series.
+//	g := prometheus.NewGaugeVec(prometheus.GaugeOpts{
+//	        Name: "nagus_ebay_api_calls_budget",
+//	        Help: "Configured eBay API call budget for the current UTC day.",
+//	}, []string{"source"})
+//	p.PromRegistry.MustRegister(g)
+//
+// Use a collector whose Collect method reads live state at SCRAPE TIME if the
+// value is derived (a budget that rolls at UTC midnight, a store row count):
+// that preserves the pull semantics a hand-rolled handler had, with no
+// background loop to keep in sync.
+//
+// Gate it with testutil.CollectAndCompare against a golden file captured from
+// the endpoint BEFORE the migration. That is the only check that catches a
+// renamed family, because nothing else fails.
+//
+// This is what nagus had to do for nagus_ebay_api_calls_{budget,used,remaining},
+// the only real operational signal it had; working it out required reading
+// newMeterProvider, which is why it is written down here.
+//
 // # Logging hygiene (policy, not a suggestion)
 //
 // Downstream services hold household inventory: what a family owns, where it
@@ -48,6 +99,14 @@
 //     one careless call site does not become a data leak. The backstop is not
 //     an excuse to rely on it.
 //   - Debug level may carry more, and debug level is off in production.
+//
+// The deny list is a FLEET DEFAULT, and it is deliberately not a fleet law: it
+// covers credentials, PII and raw request material, but not domain vocabulary.
+// A search service logs queries; an acquisition service logs coordinates.
+// Redacting those by default bought nothing and cost every useful debug line.
+// Tune it with [RedactKeysExcept], which will not let you uncover a credential
+// key, and write the reason at the call site. See [CredentialRedactKeys],
+// [PIIRedactKeys] and [RequestMaterialRedactKeys] to compose a list from parts.
 //
 // # Semconv churn
 //
