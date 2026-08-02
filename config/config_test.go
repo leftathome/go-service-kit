@@ -262,9 +262,9 @@ func TestLoadBadDefaultIsReportedAgainstTheEnvVar(t *testing.T) {
 
 func TestLoadUnsupportedFieldTypeIsAnError(t *testing.T) {
 	type c struct {
-		Ratio float64 `env:"SVC_RATIO"`
+		Labels map[string]string `env:"SVC_LABELS"`
 	}
-	t.Setenv("SVC_RATIO", "0.5")
+	t.Setenv("SVC_LABELS", "a=b")
 	_, err := Load[c]()
 	if err == nil {
 		t.Fatal("want error for unsupported field type, got nil")
@@ -272,8 +272,255 @@ func TestLoadUnsupportedFieldTypeIsAnError(t *testing.T) {
 	if !errors.Is(err, ErrUnsupportedType) {
 		t.Errorf("want ErrUnsupportedType, got %v", err)
 	}
-	if !strings.Contains(err.Error(), "SVC_RATIO") {
-		t.Errorf("error missing SVC_RATIO: %v", err)
+	// The env var name must survive into the message: an operator reading a
+	// crash log needs the knob, not the Go type alone.
+	if !strings.Contains(err.Error(), "SVC_LABELS") {
+		t.Errorf("error missing SVC_LABELS: %v", err)
+	}
+}
+
+// --- floats -----------------------------------------------------------------
+//
+// nagus could not adopt this package at all without float64: NAGUS_MIN_CAPACITY
+// (terabytes) and NAGUS_LAND_{MIN,MAX}_ACREAGE are all fractional thresholds.
+
+func TestLoadParsesFloats(t *testing.T) {
+	type c struct {
+		MinCapacity float64 `env:"SVC_MIN_CAPACITY"`
+		MinAcreage  float64 `env:"SVC_MIN_ACREAGE" default:"0.25"`
+		Ratio       float32 `env:"SVC_RATIO"`
+	}
+	t.Setenv("SVC_MIN_CAPACITY", "17.5")
+	t.Setenv("SVC_RATIO", "-2.5e-3")
+
+	cfg, err := Load[c]()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.MinCapacity != 17.5 {
+		t.Errorf("MinCapacity = %v, want 17.5", cfg.MinCapacity)
+	}
+	if cfg.MinAcreage != 0.25 {
+		t.Errorf("MinAcreage = %v, want 0.25 (from default)", cfg.MinAcreage)
+	}
+	if cfg.Ratio != -2.5e-3 {
+		t.Errorf("Ratio = %v, want -0.0025", cfg.Ratio)
+	}
+}
+
+func TestLoadRejectsNonFiniteFloats(t *testing.T) {
+	type c struct {
+		Threshold float64 `env:"SVC_THRESHOLD"`
+	}
+	// A NaN threshold makes every comparison against it false, silently: the
+	// service starts, filters nothing, and looks healthy. Refuse it at boot.
+	for _, raw := range []string{"NaN", "nan", "Inf", "+Inf", "-Inf", "infinity"} {
+		t.Setenv("SVC_THRESHOLD", raw)
+		if _, err := Load[c](); err == nil {
+			t.Errorf("Load(%q) succeeded, want an error", raw)
+		}
+	}
+}
+
+func TestLoadRejectsFloatOutOfRangeForWidth(t *testing.T) {
+	type c struct {
+		Small float32 `env:"SVC_SMALL"`
+	}
+	t.Setenv("SVC_SMALL", "1e40")
+	if _, err := Load[c](); err == nil {
+		t.Fatal("want an out-of-range error for a float32, got nil")
+	}
+}
+
+// --- unsigned and narrow integers -------------------------------------------
+
+func TestLoadParsesUnsignedAndNarrowIntegers(t *testing.T) {
+	type c struct {
+		Workers  uint   `env:"SVC_WORKERS"`
+		MaxBytes uint64 `env:"SVC_MAX_BYTES"`
+		Weight   uint8  `env:"SVC_WEIGHT"`
+		Offset   int32  `env:"SVC_OFFSET"`
+	}
+	t.Setenv("SVC_WORKERS", "4")
+	t.Setenv("SVC_MAX_BYTES", "18446744073709551615")
+	t.Setenv("SVC_WEIGHT", "255")
+	t.Setenv("SVC_OFFSET", "-2147483648")
+
+	cfg, err := Load[c]()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	want := c{Workers: 4, MaxBytes: 18446744073709551615, Weight: 255, Offset: -2147483648}
+	if cfg != want {
+		t.Errorf("Load() = %+v, want %+v", cfg, want)
+	}
+}
+
+func TestLoadRejectsNegativeUnsigned(t *testing.T) {
+	type c struct {
+		Workers uint `env:"SVC_WORKERS"`
+	}
+	t.Setenv("SVC_WORKERS", "-1")
+	_, err := Load[c]()
+	if err == nil {
+		t.Fatal("want an error for a negative unsigned value, got nil")
+	}
+	if !strings.Contains(err.Error(), "SVC_WORKERS") {
+		t.Errorf("error missing SVC_WORKERS: %v", err)
+	}
+}
+
+func TestLoadRejectsOverflowingNarrowInteger(t *testing.T) {
+	type c struct {
+		Weight uint8 `env:"SVC_WEIGHT"`
+	}
+	t.Setenv("SVC_WEIGHT", "256")
+	if _, err := Load[c](); err == nil {
+		t.Fatal("want an out-of-range error for uint8, got nil")
+	}
+}
+
+// --- time.Time ---------------------------------------------------------------
+
+func TestLoadParsesRFC3339Time(t *testing.T) {
+	type c struct {
+		CutoverAt time.Time `env:"SVC_CUTOVER_AT"`
+		Epoch     time.Time `env:"SVC_EPOCH" default:"2026-01-01T00:00:00Z"`
+	}
+	t.Setenv("SVC_CUTOVER_AT", "2026-08-02T13:45:06+02:00")
+
+	cfg, err := Load[c]()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if want := time.Date(2026, 8, 2, 13, 45, 6, 0, time.FixedZone("", 2*60*60)); !cfg.CutoverAt.Equal(want) {
+		t.Errorf("CutoverAt = %v, want %v", cfg.CutoverAt, want)
+	}
+	if want := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC); !cfg.Epoch.Equal(want) {
+		t.Errorf("Epoch = %v, want %v", cfg.Epoch, want)
+	}
+}
+
+func TestLoadRejectsNonRFC3339Time(t *testing.T) {
+	type c struct {
+		CutoverAt time.Time `env:"SVC_CUTOVER_AT"`
+	}
+	t.Setenv("SVC_CUTOVER_AT", "2026-08-02 13:45:06")
+	_, err := Load[c]()
+	if err == nil {
+		t.Fatal("want an error for a non-RFC3339 timestamp, got nil")
+	}
+	if !strings.Contains(err.Error(), "RFC 3339") {
+		t.Errorf("error does not name the accepted form: %v", err)
+	}
+}
+
+func TestLoadLeavesUntaggedTimeAlone(t *testing.T) {
+	// time.Time is a struct; loadStruct must not walk into it looking for
+	// tagged fields when it carries no env tag of its own.
+	type c struct {
+		Started time.Time
+		Addr    string `env:"SVC_ADDR" default:":8080"`
+	}
+	cfg, err := Load[c]()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if !cfg.Started.IsZero() {
+		t.Errorf("Started = %v, want the zero time", cfg.Started)
+	}
+}
+
+// --- typed slices ------------------------------------------------------------
+
+func TestLoadParsesTypedSlices(t *testing.T) {
+	type c struct {
+		Ports     []int           `env:"SVC_PORTS"`
+		Weights   []float64       `env:"SVC_WEIGHTS"`
+		Intervals []time.Duration `env:"SVC_INTERVALS" default:"1s,2m"`
+	}
+	t.Setenv("SVC_PORTS", "8080, 9090 ,7070")
+	t.Setenv("SVC_WEIGHTS", "0.5,1.5")
+
+	cfg, err := Load[c]()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	want := c{
+		Ports:     []int{8080, 9090, 7070},
+		Weights:   []float64{0.5, 1.5},
+		Intervals: []time.Duration{time.Second, 2 * time.Minute},
+	}
+	if !reflect.DeepEqual(cfg, want) {
+		t.Errorf("Load() = %+v, want %+v", cfg, want)
+	}
+}
+
+func TestLoadNamedStringSliceType(t *testing.T) {
+	type hosts []string
+	type c struct {
+		Hosts hosts `env:"SVC_HOSTS"`
+	}
+	t.Setenv("SVC_HOSTS", "a.example,b.example")
+	cfg, err := Load[c]()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if !reflect.DeepEqual(cfg.Hosts, hosts{"a.example", "b.example"}) {
+		t.Errorf("Hosts = %+v", cfg.Hosts)
+	}
+}
+
+func TestLoadBadSliceElementNamesTheEnvVarAndTheIndex(t *testing.T) {
+	type c struct {
+		Ports []int `env:"SVC_PORTS"`
+	}
+	t.Setenv("SVC_PORTS", "8080,nope,7070")
+	_, err := Load[c]()
+	if err == nil {
+		t.Fatal("want an error, got nil")
+	}
+	if !strings.Contains(err.Error(), "SVC_PORTS") || !strings.Contains(err.Error(), "element 1") {
+		t.Errorf("error should name the variable and the element: %v", err)
+	}
+}
+
+func TestLoadByteSliceIsUnsupported(t *testing.T) {
+	// []byte is []uint8, which the numeric slice path would happily read as a
+	// comma-separated list of small integers. An operator setting a []byte
+	// field means raw bytes, so refuse rather than surprise them.
+	type c struct {
+		Blob []byte `env:"SVC_BLOB"`
+	}
+	t.Setenv("SVC_BLOB", "abc")
+	_, err := Load[c]()
+	if !errors.Is(err, ErrUnsupportedType) {
+		t.Errorf("want ErrUnsupportedType for []byte, got %v", err)
+	}
+}
+
+func TestLoadNestedSliceIsUnsupported(t *testing.T) {
+	type c struct {
+		Grid [][]string `env:"SVC_GRID"`
+	}
+	t.Setenv("SVC_GRID", "a,b")
+	_, err := Load[c]()
+	if !errors.Is(err, ErrUnsupportedType) {
+		t.Errorf("want ErrUnsupportedType for [][]string, got %v", err)
+	}
+}
+
+func TestLoadRedactsSecretSliceElementsInErrors(t *testing.T) {
+	type c struct {
+		Keys []int `env:"SVC_API_KEY_IDS"`
+	}
+	t.Setenv("SVC_API_KEY_IDS", "1,hunter2")
+	_, err := Load[c]()
+	if err == nil {
+		t.Fatal("want an error, got nil")
+	}
+	if strings.Contains(err.Error(), "hunter2") {
+		t.Errorf("error echoed a value from a KEY-named variable: %v", err)
 	}
 }
 
