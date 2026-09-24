@@ -18,10 +18,38 @@ This GitLab repo is the dev remote; the module resolves through
 | `config` | Env-driven config loading with aggregated validation errors. |
 | `outbound` | The egress trust boundary: rate limiting, identifying User-Agent, `Retry-After`, backoff with jitter, mandatory timeouts, SSRF guard, redirect header hygiene. |
 | `storekit` | Generic contract-test harness that any store adapter must satisfy. |
+| `mcp` | Read-only Model Context Protocol tool server (JSON-RPC 2.0 over one HTTP POST). Tool output is structured-only, internal errors are redacted, arguments are decoded strictly -- by default, not by convention. |
+
+### Adopting `mcp`
+
+A service with a hand-rolled MCP endpoint (nagus `cmd/nagus/mcp.go`, quark
+`internal/mcp`) replaces its JSON-RPC core with one `mcp.NewTool` per tool and
+one `mcp.New`, mounted with `api.RawRoute("POST /mcp", srv)`:
+
+1. Give each tool an argument struct whose JSON fields are exactly the
+   inputSchema's `properties`; `mcp.New` refuses a mismatch.
+2. Return `mcp.Structured(count, map[string]any{...})` or `mcp.NotFound()`.
+   The library writes the text block; there is no way to put a value in it.
+3. Return `mcp.InvalidArgument("constant message")` for a bad argument; return
+   any other error as-is -- it is logged and answered with
+   `Options.InternalErrorMessage`.
+4. Keep the service's own protocol tests pointed at the mounted handler; they
+   should pass unchanged except where they asserted an error message that
+   echoed the method or tool name, which the library no longer does.
+
+A mutating tool needs `ToolSpec.Mutating` and `Options.AllowMutatingTools`, and
+the endpoint must then be authenticated. See the package doc.
+
+## Decisions
+
+Architecture decision records live in [`docs/adr/`](docs/adr/).
+[ADR 0001](docs/adr/0001-sqlite-adapter.md) (Proposed) covers whether the kit
+gains a SQLite adapter.
 
 ## Status
 
-v0.1.0 -- all six packages implemented and tested. See the design spec in
+v0.1.0 -- the first six packages implemented and tested; `mcp` is unreleased
+(see CHANGELOG). See the design spec in
 [`go-service-template`](https://gitlab.orac.local/homelab/go-service-template)
 at `docs/superpowers/specs/2026-07-28-go-service-template-design.md`.
 
