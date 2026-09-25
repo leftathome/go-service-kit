@@ -16,7 +16,7 @@ type idArgs struct {
 // order of checks in ServeHTTP.
 func TestCheckArgumentsRejectsTrailingData(t *testing.T) {
 	tool := NewTool(ToolSpec{
-		Name: "get", Description: "d",
+		Name: "get", Description: "d", Access: ReadOnly,
 		InputSchema: map[string]any{"properties": map[string]any{"id": map[string]any{"type": "string"}}},
 	}, func(context.Context, idArgs) (Result, error) { return NotFound(), nil })
 	if tool.err != nil {

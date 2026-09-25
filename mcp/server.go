@@ -9,6 +9,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"runtime/debug"
 	"slices"
 	"strings"
 )
@@ -17,9 +18,13 @@ import (
 // when the client asks for none, or for one this package does not support.
 const DefaultProtocolVersion = "2025-06-18"
 
-// supportedProtocolVersions is newest first. The tool surface this package
-// implements is the same in all of them.
-var supportedProtocolVersions = []string{DefaultProtocolVersion, "2025-03-26", "2024-11-05"}
+// supportedProtocolVersions is newest first. It is deliberately ONE version:
+// structuredContent first appears in 2025-06-18, and every value this package
+// returns lives there. Agreeing to 2025-03-26 or 2024-11-05 would hand an older
+// client a result whose only content it understands is a count -- a silent
+// "no data". An older client is instead offered 2025-06-18 and, per the MCP
+// lifecycle, disconnects if it cannot speak it.
+var supportedProtocolVersions = []string{DefaultProtocolVersion}
 
 // SupportedProtocolVersions returns the protocol versions initialize will
 // agree to, newest first.
@@ -65,10 +70,20 @@ type Options struct {
 	// that is the point.
 	InternalErrorMessage Message
 
-	// AllowMutatingTools lets [New] accept tools with [ToolSpec.Mutating] set.
-	// Set it only after the endpoint is behind authentication that a write
-	// needs; see the package doc.
+	// AllowMutatingTools lets [New] accept tools whose [ToolSpec.Access] is
+	// [Mutating]. Set it only after the endpoint is behind authentication that
+	// a write needs; see the package doc.
 	AllowMutatingTools bool
+
+	// AllowedOrigins lists the exact Origin header values (scheme://host[:port])
+	// a request may carry. A request WITH an Origin header that is not listed is
+	// refused with 403 before its body is read; a request with no Origin header
+	// is unaffected. The MCP transport requires this check against DNS
+	// rebinding: a browser page on an attacker's domain can otherwise POST to
+	// a server on the victim's network. Agent clients running server-side send
+	// no Origin, so the default -- nil, which refuses every browser origin --
+	// costs them nothing. List an origin only for a browser-based client.
+	AllowedOrigins []string
 }
 
 // Server is an MCP server over one HTTP POST endpoint. It is an
@@ -80,6 +95,7 @@ type Server struct {
 	logger       *slog.Logger
 	maxBody      int64
 	internalMsg  Message
+	origins      map[string]bool
 	tools        []Tool
 	byName       map[string]*Tool
 }
@@ -102,6 +118,7 @@ func New(opts Options, tools ...Tool) (*Server, error) {
 		logger:       opts.Logger,
 		maxBody:      opts.MaxBodyBytes,
 		internalMsg:  opts.InternalErrorMessage,
+		origins:      make(map[string]bool, len(opts.AllowedOrigins)),
 		tools:        make([]Tool, 0, len(tools)),
 		byName:       make(map[string]*Tool, len(tools)),
 	}
@@ -117,6 +134,13 @@ func New(opts Options, tools ...Tool) (*Server, error) {
 	if s.internalMsg == "" {
 		s.internalMsg = DefaultInternalErrorMessage
 	}
+	for _, o := range opts.AllowedOrigins {
+		if o == "" || o == "*" || o == "null" || !strings.Contains(o, "://") || strings.HasSuffix(o, "/") {
+			errs = append(errs, fmt.Errorf("mcp: AllowedOrigins entry %q must be an exact scheme://host[:port]", o))
+			continue
+		}
+		s.origins[o] = true
+	}
 
 	seen := map[string]bool{}
 	for i, t := range tools {
@@ -130,7 +154,7 @@ func New(opts Options, tools ...Tool) (*Server, error) {
 		case seen[t.spec.Name]:
 			errs = append(errs, fmt.Errorf("mcp: tool %s is registered twice", t.spec.Name))
 			continue
-		case t.spec.Mutating && !opts.AllowMutatingTools:
+		case t.spec.Access == Mutating && !opts.AllowMutatingTools:
 			errs = append(errs, fmt.Errorf("mcp: tool %s is Mutating but Options.AllowMutatingTools is false", t.spec.Name))
 			continue
 		}
@@ -187,6 +211,10 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		w.Header().Set("Allow", http.MethodPost)
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if origin, ok := r.Header["Origin"]; ok && (len(origin) != 1 || !s.origins[origin[0]]) {
+		http.Error(w, "origin not allowed", http.StatusForbidden)
 		return
 	}
 	body, err := io.ReadAll(io.LimitReader(r.Body, s.maxBody+1))
@@ -361,27 +389,44 @@ func (s *Server) callTool(ctx context.Context, params json.RawMessage) (any, *rp
 	if err != nil {
 		return nil, s.handlerError(ctx, t.spec.Name, err)
 	}
-	res, err := s.invoke(ctx, t, args)
+	return s.invoke(ctx, t, args)
+}
+
+// invoke runs the handler AND renders its result under one recover. Rendering
+// marshals the handler's data, which runs the handler's own MarshalJSON
+// methods: a panic there is a handler panic too, and must not escape
+// ServeHTTP -- net/http would log the panic value and drop the connection.
+func (s *Server) invoke(ctx context.Context, t *Tool, args json.RawMessage) (out any, rpcErr *rpcError) {
+	defer func() {
+		if rec := recover(); rec != nil {
+			// The panic value goes to the log only: it is arbitrary handler
+			// state. The stack is what makes the log line actionable.
+			s.logger.ErrorContext(ctx, "mcp tool call panicked",
+				slog.String("tool", t.spec.Name),
+				slog.String("panic", fmt.Sprint(rec)),
+				slog.String("stack", string(debug.Stack())))
+			out, rpcErr = nil, &rpcError{Code: CodeInternalError, Message: s.internalMsg}
+		}
+	}()
+	res, err := t.call(ctx, args)
 	if err != nil {
 		return nil, s.handlerError(ctx, t.spec.Name, err)
 	}
 	return s.render(ctx, t, res)
 }
 
-// invoke runs the handler, converting a panic into an internal error.
-func (s *Server) invoke(ctx context.Context, t *Tool, args json.RawMessage) (res Result, err error) {
-	defer func() {
-		if rec := recover(); rec != nil {
-			err = fmt.Errorf("mcp: tool handler panicked: %v", rec)
-		}
-	}()
-	return t.call(ctx, args)
-}
-
 // handlerError maps a handler error to the wire. Only an InvalidArgument
 // reaches the client; everything else is logged and replaced.
+//
+// An InvalidArgument anywhere in the chain wins, so errors.Join(dbErr,
+// InvalidArgument(...)) answers -32602. Whatever else the chain carried is not
+// silently dropped: it is logged at debug.
 func (s *Server) handlerError(ctx context.Context, tool string, err error) *rpcError {
 	if ae, ok := asArgumentError(err); ok {
+		if error(ae) != err { //nolint:errorlint // identity, not errors.Is: "is the chain MORE than the argument error?"
+			s.logger.DebugContext(ctx, "mcp tool call rejected arguments; the error chain carried more",
+				slog.String("tool", tool), slog.Any("error", err))
+		}
 		return &rpcError{Code: CodeInvalidParams, Message: "invalid arguments: " + ae.msg}
 	}
 	return s.internal(ctx, tool, err)
@@ -410,7 +455,7 @@ func (s *Server) render(ctx context.Context, t *Tool, res Result) (any, *rpcErro
 			return nil, s.internal(ctx, t.spec.Name, errors.New("mcp: structuredContent must marshal to a JSON object"))
 		}
 		return toolResult{
-			Content:           []textContent{{Type: "text", Text: successText(res.count, t.spec.Noun)}},
+			Content:           []textContent{{Type: "text", Text: successText(res.count, t.spec.Noun, t.spec.Note)}},
 			StructuredContent: data,
 		}, nil
 	default:

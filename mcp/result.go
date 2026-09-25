@@ -86,7 +86,11 @@ func asArgumentError(err error) (*argumentError, bool) {
 	return nil, false
 }
 
-// successText renders the text block of a [Structured] result.
-func successText(count int, noun string) string {
-	return fmt.Sprintf("%d %s. %s", count, noun, untrustedNote)
+// successText renders the text block of a [Structured] result. note is the
+// tool's registration-time [ToolSpec.Note], appended after the fixed pointer.
+func successText(count int, noun string, note Message) string {
+	if note == "" {
+		return fmt.Sprintf("%d %s. %s", count, noun, untrustedNote)
+	}
+	return fmt.Sprintf("%d %s. %s %s", count, noun, untrustedNote, note)
 }

@@ -38,6 +38,22 @@ quark's column is the one that is right, and it got there by being bitten:
   which is what makes `busy_timeout` mean what it says. nagus's two adapters do
   not set it; they are protected only by the one-connection pool serialising
   everything inside one process.
+
+  To be plain about scope: with one connection per process, this failure
+  CANNOT occur inside a single process -- there is never a second transaction
+  to contend with. It needs a SECOND PROCESS opening the same file. That is
+  exactly the case the kit should be designed for, and it is not
+  hypothetical for nagus: its `ingest` and `search` CLI subcommands
+  (`cmd/nagus/main.go`) open the store through the same `storeFlags.open` as
+  `serve`, so an operator running one against a live sqlite file is the
+  second process. Whether nagus has actually hit it is **unknown**: its code
+  comments record an in-process `SQLITE_BUSY` bug in `sqliteoffer` (offers
+  dropped when two sources ingested at once, fixed by the one-connection cap
+  and covered by `offerstoretest`'s concurrent-writes clause), not the
+  cross-process upgrade failure, and production nagus has since moved to the
+  postgres backend (the sqlite files remain on the PVC as a fallback). So
+  option B's value here is preventive: it makes the second-process case
+  correct before a service meets it, rather than fixing an observed outage.
 - **Contention should be a typed error**, so a handler answers 503 rather than
   a 500 carrying a driver string. quark maps `SQLITE_BUSY`/`SQLITE_LOCKED` to a
   sentinel; nagus does not.
@@ -86,7 +102,29 @@ about WHAT is stored in it:
   its own transaction, tracked in `PRAGMA user_version`. A database whose
   version is NEWER than the binary knows is refused -- the rollback case none of
   the current adapters can detect. Services keep their DDL; the kit keeps the
-  bookkeeping.
+  bookkeeping. `journal_mode` is set by `Open` through the DSN, never by a
+  migration: SQLite cannot change the journal mode inside a transaction, and
+  every migration runs in one.
+
+  **Adopting `Migrate` on an existing database.** Every nagus and quark
+  database in existence today has `user_version = 0` with its schema already
+  present, so "version 0 means empty" is false and migration 1 cannot be a
+  plain `CREATE TABLE`. The rule: **migration 1 is the BASELINE and must be
+  idempotent** -- the adapter's current `CREATE ... IF NOT EXISTS` schema,
+  verbatim -- so that it is a no-op on an existing database and a full create
+  on a new one, after which `user_version` is 1 either way. Later migrations
+  are ordinary. Two adapters need more than that:
+
+  - nagus `sqliteoffer` evolves by PROBE-THEN-ALTER (`PRAGMA table_info`,
+    then `ALTER TABLE ADD COLUMN` for each missing column), because SQLite
+    has no `ADD COLUMN IF NOT EXISTS`. Plain numbered migrations cannot
+    express "add this column unless an older binary already did", so its
+    baseline must be the probe-then-alter FUNCTION, not a SQL string.
+    `Migration` therefore takes a `func(ctx, *sql.Tx) error`, with a SQL
+    string as a convenience, not the other way round.
+  - quark's `schema_meta` Unicode-version check and skeleton backfill are
+    domain invariants, not schema versions. They stay in quark, run after
+    `Migrate`, and are not absorbed into `user_version`.
 - `IsBusy(err) bool` (`SQLITE_BUSY`/`SQLITE_LOCKED`) and
   `IsConstraint(err) bool`, so contention and uniqueness become typed errors
   without every service importing the driver's error type and hard-coding 5
@@ -105,12 +143,25 @@ The kit's go.mod gains `modernc.org/sqlite` (and transitively
   vulnerabilities to that service.
 - **Against:** the kit's own `go.mod`/`go.sum` carry the driver and its large
   transpiled libc, so every kit consumer sees those modules in `go mod graph`
-  and Renovate PRs for them arrive at the kit. MVS selects the newer of the kit's and the
-  service's driver requirement, so a kit bump can silently drag a SQLite-using
-  service onto a driver version it never tested -- manageable with a Renovate
-  group that moves the kit and those services in step, but a real coordination
-  cost. The kit's CI runs the driver's tests-by-use, which is
-  slower than today's suite.
+  and Renovate PRs for them arrive at the kit.
+
+  **The real coordination cost is the libc pin.** `modernc.org/sqlite`'s
+  transpiled code is tied to one EXACT `modernc.org/libc` version, and
+  upstream requires downstream modules to pin exactly the libc its `go.mod`
+  pins (its CLAUDE.md, "Fragile `modernc.org/libc` coupling"; issue #177;
+  v1.33.0, v1.34.3 and v1.42.0 are retracted for this). MVS does not know
+  that: it selects the HIGHEST libc any module in the build requires. If the
+  kit and a service ever require different sqlite versions, the build gets
+  the higher sqlite AND the higher libc -- which is fine only if both came
+  from the same sqlite release. A kit that bumps libc without bumping sqlite
+  (or a service that pins libc for its own reasons) produces a combination
+  upstream never tested. The kit, nagus and quark must therefore move
+  `modernc.org/sqlite` and `modernc.org/libc` TOGETHER, as one Renovate
+  group, with libc always set to exactly what that sqlite release pins. This
+  is visible, not silent -- a kit bump shows up in the service's go.mod diff
+  when it upgrades the kit -- but it is easy to wave through.
+
+  The kit's CI also exercises the driver, which is slower than today's suite.
 
 ### C. The same package as a nested module (`go-service-kit/sqlitekit` with its own go.mod)
 
@@ -166,13 +217,17 @@ Conditions, if accepted:
 
 1. The package defaults are quark's, verbatim, with the reasons in its doc
    (this ADR's Context table is the source).
-2. A Renovate group keeps `modernc.org/sqlite` in step across the kit, nagus
-   and quark.
-3. The first adopters are nagus's two adapters (they gain the most) and quark's
+2. A Renovate group moves `modernc.org/sqlite` and `modernc.org/libc`
+   together, libc pinned to exactly what that sqlite release's go.mod pins,
+   across the kit, nagus and quark; and a kit test asserts the kit's go.mod
+   libc equals the one its sqlite requires, so a lone libc bump fails CI.
+3. Migration 1 of every adopter is its current idempotent schema (the
+   baseline rule above).
+4. The first adopters are nagus's two adapters (they gain the most) and quark's
    `OpenSQLite`; each adoption is a follow-up MR in that service, not part of
-   the kit change. quark's Unicode-version check becomes a service-level
-   migration step on top of `Migrate`, not a kit feature.
-4. `storekit`'s harness runs against a `sqlitekit`-opened reference adapter in
+   the kit change. quark's Unicode-version check stays a service-level step
+   run after `Migrate`, not a kit feature.
+5. `storekit`'s harness runs against a `sqlitekit`-opened reference adapter in
    the kit's own tests, so the harness and the open sequence are proven
    together.
 
