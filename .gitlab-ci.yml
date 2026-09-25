@@ -1,0 +1,79 @@
+# GitLab CI for gitlab.orac.local -- the PRIMARY pipeline for go-service-kit.
+#
+# lint -> test -> vulncheck. The kit is a library: no image, no chart, no
+# release stage. It had no GitLab pipeline at all until 2026-09-24, so MRs
+# merged ungated and main sat red on govulncheck (gsk-s7j) with nothing to
+# show it.
+#
+# Every gate shells out to a `make` target, exactly as in go-service-template:
+# the GitHub Actions workflow (.github/workflows/ci.yml) calls the SAME
+# targets, so the two pipelines cannot drift from each other or from what a
+# developer runs locally. Do not inline a bare `go test` here; add it to the
+# Makefile and call the target.
+#
+# This file is mirrored to public GitHub, so it carries no cluster specifics.
+
+stages:
+  - lint
+  - test
+  - vulncheck
+
+variables:
+  GOPATH: "$CI_PROJECT_DIR/.cache/go"
+  GOMODCACHE: "$CI_PROJECT_DIR/.cache/go/pkg/mod"
+  GOCACHE: "$CI_PROJECT_DIR/.cache/go-build"
+  # readonly: a build that needs a requirement go.mod does not record fails
+  # here with the requirement named, instead of silently editing go.mod.
+  GOFLAGS: "-mod=readonly"
+
+# Module + build cache keyed on go.sum: a dependency change gets a fresh
+# cache, an unchanged graph reuses one.
+cache:
+  key:
+    files:
+      - go.sum
+  paths:
+    - .cache/go/pkg/mod
+    - .cache/go-build
+
+# PINNED BY DIGEST, the same single-platform (amd64) golang digest the
+# template and nagus gates use, for two reasons (see go-service-template's
+# .gitlab-ci.yml for the full history):
+#   - never a Docker Hub TAG: zot cannot sync the fat multi-arch index an
+#     official-image tag resolves to, and the job dies after a ~9m pull as
+#     runner_system_failure (gitops CLAUDE.md);
+#   - a digest already warm in the mirror starts in seconds, where a cold
+#     reference can exceed the runner's pod-start timeout.
+# Refresh together with go-service-template:
+#   crane digest --platform linux/amd64 docker.io/library/golang:1.26
+.go-job:
+  image: docker.io/golang:1.26@sha256:23fdfd3a6abc97c81e32a724cdd1cf541c06c416eb04d717815f4ed7c75623d0
+  before_script:
+    - "go version"
+    - "go env GOPATH GOMODCACHE GOCACHE GOFLAGS"
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_COMMIT_BRANCH == "main"'
+    - if: '$CI_COMMIT_TAG'
+    - if: '$CI_PIPELINE_SOURCE == "schedule"'
+
+lint:
+  extends: .go-job
+  stage: lint
+  script:
+    - "make lint"
+
+test:
+  extends: .go-job
+  stage: test
+  script:
+    - "make test"
+
+# A new CVE in a dependency turns this red with no code change, which is the
+# point: a scheduled pipeline (set one up on main, e.g. nightly) is what
+# surfaces it between commits.
+vulncheck:
+  extends: .go-job
+  stage: vulncheck
+  script:
+    - "make vulncheck"
