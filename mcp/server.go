@@ -1,0 +1,419 @@
+package mcp
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"log/slog"
+	"net/http"
+	"slices"
+	"strings"
+)
+
+// DefaultProtocolVersion is the MCP protocol version initialize answers with
+// when the client asks for none, or for one this package does not support.
+const DefaultProtocolVersion = "2025-06-18"
+
+// supportedProtocolVersions is newest first. The tool surface this package
+// implements is the same in all of them.
+var supportedProtocolVersions = []string{DefaultProtocolVersion, "2025-03-26", "2024-11-05"}
+
+// SupportedProtocolVersions returns the protocol versions initialize will
+// agree to, newest first.
+func SupportedProtocolVersions() []string { return slices.Clone(supportedProtocolVersions) }
+
+// DefaultMaxBodyBytes bounds a request body when [Options.MaxBodyBytes] is
+// zero. Tool arguments are a handful of small fields.
+const DefaultMaxBodyBytes int64 = 1 << 20
+
+// JSON-RPC 2.0 error codes used by this package.
+const (
+	CodeParseError     = -32700
+	CodeInvalidRequest = -32600
+	CodeMethodNotFound = -32601
+	CodeInvalidParams  = -32602
+	CodeInternalError  = -32603
+)
+
+// Options configures a [Server].
+type Options struct {
+	// Name is serverInfo.name in the initialize result. Required.
+	Name string
+
+	// Version is serverInfo.version. Empty means "0.0.0".
+	Version string
+
+	// Instructions, when set, is returned as the initialize result's
+	// instructions: server-wide guidance for the agent, such as how untrusted
+	// values are marked. It is fixed at construction.
+	Instructions string
+
+	// Logger receives the detail of every internal error and handler panic.
+	// Nil means slog.Default().
+	Logger *slog.Logger
+
+	// MaxBodyBytes caps the request body. Zero means [DefaultMaxBodyBytes];
+	// negative is refused by [New].
+	MaxBodyBytes int64
+
+	// InternalErrorMessage is the JSON-RPC -32603 message every internal
+	// failure is answered with, e.g. "the item store is unavailable". Empty
+	// means [DefaultInternalErrorMessage]. It is the same for every failure:
+	// that is the point.
+	InternalErrorMessage Message
+
+	// AllowMutatingTools lets [New] accept tools with [ToolSpec.Mutating] set.
+	// Set it only after the endpoint is behind authentication that a write
+	// needs; see the package doc.
+	AllowMutatingTools bool
+}
+
+// Server is an MCP server over one HTTP POST endpoint. It is an
+// [http.Handler]; it is safe for concurrent use and immutable after [New].
+type Server struct {
+	name         string
+	version      string
+	instructions string
+	logger       *slog.Logger
+	maxBody      int64
+	internalMsg  Message
+	tools        []Tool
+	byName       map[string]*Tool
+}
+
+// New builds a server exposing tools, in the order given. It returns every
+// problem with the options and the tools joined into one error; each is a
+// wiring bug, so a service should fail startup on it.
+func New(opts Options, tools ...Tool) (*Server, error) {
+	var errs []error
+	if strings.TrimSpace(opts.Name) == "" {
+		errs = append(errs, errors.New("mcp: Options.Name is required"))
+	}
+	if opts.MaxBodyBytes < 0 {
+		errs = append(errs, errors.New("mcp: Options.MaxBodyBytes must not be negative"))
+	}
+	s := &Server{
+		name:         opts.Name,
+		version:      opts.Version,
+		instructions: opts.Instructions,
+		logger:       opts.Logger,
+		maxBody:      opts.MaxBodyBytes,
+		internalMsg:  opts.InternalErrorMessage,
+		tools:        make([]Tool, 0, len(tools)),
+		byName:       make(map[string]*Tool, len(tools)),
+	}
+	if s.version == "" {
+		s.version = "0.0.0"
+	}
+	if s.logger == nil {
+		s.logger = slog.Default()
+	}
+	if s.maxBody == 0 {
+		s.maxBody = DefaultMaxBodyBytes
+	}
+	if s.internalMsg == "" {
+		s.internalMsg = DefaultInternalErrorMessage
+	}
+
+	seen := map[string]bool{}
+	for i, t := range tools {
+		switch {
+		case t.err != nil:
+			errs = append(errs, t.err)
+			continue
+		case t.call == nil:
+			errs = append(errs, fmt.Errorf("mcp: tool #%d was not built with NewTool", i))
+			continue
+		case seen[t.spec.Name]:
+			errs = append(errs, fmt.Errorf("mcp: tool %s is registered twice", t.spec.Name))
+			continue
+		case t.spec.Mutating && !opts.AllowMutatingTools:
+			errs = append(errs, fmt.Errorf("mcp: tool %s is Mutating but Options.AllowMutatingTools is false", t.spec.Name))
+			continue
+		}
+		seen[t.spec.Name] = true
+		s.tools = append(s.tools, t)
+	}
+	if len(errs) > 0 {
+		return nil, errors.Join(errs...)
+	}
+	for i := range s.tools {
+		s.byName[s.tools[i].spec.Name] = &s.tools[i]
+	}
+	return s, nil
+}
+
+// ToolNames returns the registered tool names in tools/list order. Assert on it
+// in a service test so the surface only grows deliberately.
+func (s *Server) ToolNames() []string {
+	names := make([]string, len(s.tools))
+	for i := range s.tools {
+		names[i] = s.tools[i].spec.Name
+	}
+	return names
+}
+
+// rpcError is the JSON-RPC 2.0 error object. It never carries data.
+type rpcError struct {
+	Code    int     `json:"code"`
+	Message Message `json:"message"`
+}
+
+type rpcResponse struct {
+	JSONRPC string          `json:"jsonrpc"`
+	ID      json.RawMessage `json:"id"`
+	Result  any             `json:"result,omitempty"`
+	Error   *rpcError       `json:"error,omitempty"`
+}
+
+type textContent struct {
+	Type string `json:"type"`
+	Text string `json:"text"`
+}
+
+type toolResult struct {
+	Content           []textContent   `json:"content"`
+	StructuredContent json.RawMessage `json:"structuredContent,omitempty"`
+	IsError           bool            `json:"isError"`
+}
+
+var nullID = json.RawMessage("null")
+
+// ServeHTTP handles one JSON-RPC 2.0 request object.
+func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", http.MethodPost)
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	body, err := io.ReadAll(io.LimitReader(r.Body, s.maxBody+1))
+	_ = r.Body.Close()
+	if err != nil {
+		writeResponse(w, http.StatusOK, errorResponse(nullID, CodeParseError, "parse error: request body unreadable"))
+		return
+	}
+	if int64(len(body)) > s.maxBody {
+		writeResponse(w, http.StatusRequestEntityTooLarge, errorResponse(nullID, CodeInvalidRequest, "invalid request: body too large"))
+		return
+	}
+
+	trimmed := bytes.TrimSpace(body)
+	switch {
+	case len(trimmed) == 0:
+		writeResponse(w, http.StatusOK, errorResponse(nullID, CodeParseError, "parse error: empty body"))
+		return
+	case !json.Valid(trimmed):
+		writeResponse(w, http.StatusOK, errorResponse(nullID, CodeParseError, "parse error: body is not valid JSON"))
+		return
+	case trimmed[0] == '[':
+		writeResponse(w, http.StatusOK, errorResponse(nullID, CodeInvalidRequest, "invalid request: batch requests are not supported"))
+		return
+	case trimmed[0] != '{':
+		writeResponse(w, http.StatusOK, errorResponse(nullID, CodeInvalidRequest, "invalid request: body must be a JSON object"))
+		return
+	}
+
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(trimmed, &raw); err != nil {
+		writeResponse(w, http.StatusOK, errorResponse(nullID, CodeParseError, "parse error: body is not valid JSON"))
+		return
+	}
+
+	// The PRESENCE of "id", not its value, makes this a request rather than a
+	// notification (JSON-RPC 2.0 section 4.1).
+	idRaw, hasID := raw["id"]
+	id := nullID
+	if hasID {
+		if !validID(idRaw) {
+			writeResponse(w, http.StatusOK, errorResponse(nullID, CodeInvalidRequest, "invalid request: id must be a string, a number or null"))
+			return
+		}
+		id = idRaw
+	}
+
+	var version string
+	if v, ok := raw["jsonrpc"]; !ok || json.Unmarshal(v, &version) != nil || version != "2.0" {
+		s.reply(w, hasID, errorResponse(id, CodeInvalidRequest, `invalid request: jsonrpc must be "2.0"`))
+		return
+	}
+	var method string
+	if m, ok := raw["method"]; !ok || json.Unmarshal(m, &method) != nil || method == "" {
+		s.reply(w, hasID, errorResponse(id, CodeInvalidRequest, "invalid request: method must be a non-empty string"))
+		return
+	}
+
+	if !hasID {
+		// A notification is acknowledged and never dispatched. The only ones a
+		// tool server receives (notifications/initialized, .../cancelled)
+		// need no action, and anything else sent without an id -- a
+		// tools/call, say -- must not run invisibly.
+		w.WriteHeader(http.StatusAccepted)
+		return
+	}
+
+	result, rpcErr := s.dispatch(r.Context(), method, raw["params"])
+	if rpcErr != nil {
+		writeResponse(w, http.StatusOK, rpcResponse{JSONRPC: "2.0", ID: id, Error: rpcErr})
+		return
+	}
+	writeResponse(w, http.StatusOK, rpcResponse{JSONRPC: "2.0", ID: id, Result: result})
+}
+
+// reply writes resp for a request, or a bare 202 for a notification: a
+// notification never gets a body, even when it was malformed.
+func (s *Server) reply(w http.ResponseWriter, hasID bool, resp rpcResponse) {
+	if !hasID {
+		w.WriteHeader(http.StatusAccepted)
+		return
+	}
+	writeResponse(w, http.StatusOK, resp)
+}
+
+func validID(raw json.RawMessage) bool {
+	t := bytes.TrimSpace(raw)
+	if len(t) == 0 {
+		return false
+	}
+	switch t[0] {
+	case '"', 'n', '-', '0', '1', '2', '3', '4', '5', '6', '7', '8', '9':
+		return true
+	}
+	return false
+}
+
+func errorResponse(id json.RawMessage, code int, msg Message) rpcResponse {
+	return rpcResponse{JSONRPC: "2.0", ID: id, Error: &rpcError{Code: code, Message: msg}}
+}
+
+func writeResponse(w http.ResponseWriter, status int, resp rpcResponse) {
+	b, err := json.Marshal(resp)
+	if err != nil {
+		// Every result is pre-marshaled or built from plain maps; this cannot
+		// happen short of a bug here. Answer something well formed anyway.
+		b, _ = json.Marshal(errorResponse(resp.ID, CodeInternalError, DefaultInternalErrorMessage))
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_, _ = w.Write(append(b, '\n'))
+}
+
+func (s *Server) dispatch(ctx context.Context, method string, params json.RawMessage) (any, *rpcError) {
+	switch method {
+	case "initialize":
+		return s.initialize(params), nil
+	case "ping", "notifications/initialized":
+		// notifications/initialized is a notification in normal use and never
+		// reaches here; answer it gracefully if a client sends it with an id.
+		return map[string]any{}, nil
+	case "tools/list":
+		descs := make([]map[string]any, len(s.tools))
+		for i := range s.tools {
+			descs[i] = s.tools[i].descriptor()
+		}
+		return map[string]any{"tools": descs}, nil
+	case "tools/call":
+		return s.callTool(ctx, params)
+	default:
+		// The method is NOT repeated: it is caller input.
+		return nil, &rpcError{Code: CodeMethodNotFound, Message: "method not found"}
+	}
+}
+
+func (s *Server) initialize(params json.RawMessage) map[string]any {
+	var p struct {
+		ProtocolVersion string `json:"protocolVersion"`
+	}
+	if len(params) > 0 {
+		_ = json.Unmarshal(params, &p) // best effort: fall back to the default
+	}
+	version := DefaultProtocolVersion
+	if slices.Contains(supportedProtocolVersions, p.ProtocolVersion) {
+		version = p.ProtocolVersion
+	}
+	out := map[string]any{
+		"protocolVersion": version,
+		"capabilities":    map[string]any{"tools": map[string]any{"listChanged": false}},
+		"serverInfo":      map[string]any{"name": s.name, "version": s.version},
+	}
+	if s.instructions != "" {
+		out["instructions"] = s.instructions
+	}
+	return out
+}
+
+func (s *Server) callTool(ctx context.Context, params json.RawMessage) (any, *rpcError) {
+	var p struct {
+		Name      string          `json:"name"`
+		Arguments json.RawMessage `json:"arguments"`
+	}
+	if err := json.Unmarshal(params, &p); err != nil || p.Name == "" {
+		return nil, &rpcError{Code: CodeInvalidParams, Message: "invalid params: expected {name, arguments}"}
+	}
+	t, ok := s.byName[p.Name]
+	if !ok {
+		// The name is NOT repeated: it is caller input.
+		return nil, &rpcError{Code: CodeInvalidParams, Message: "unknown tool"}
+	}
+	args, err := t.checkArguments(p.Arguments)
+	if err != nil {
+		return nil, s.handlerError(ctx, t.spec.Name, err)
+	}
+	res, err := s.invoke(ctx, t, args)
+	if err != nil {
+		return nil, s.handlerError(ctx, t.spec.Name, err)
+	}
+	return s.render(ctx, t, res)
+}
+
+// invoke runs the handler, converting a panic into an internal error.
+func (s *Server) invoke(ctx context.Context, t *Tool, args json.RawMessage) (res Result, err error) {
+	defer func() {
+		if rec := recover(); rec != nil {
+			err = fmt.Errorf("mcp: tool handler panicked: %v", rec)
+		}
+	}()
+	return t.call(ctx, args)
+}
+
+// handlerError maps a handler error to the wire. Only an InvalidArgument
+// reaches the client; everything else is logged and replaced.
+func (s *Server) handlerError(ctx context.Context, tool string, err error) *rpcError {
+	if ae, ok := asArgumentError(err); ok {
+		return &rpcError{Code: CodeInvalidParams, Message: "invalid arguments: " + ae.msg}
+	}
+	return s.internal(ctx, tool, err)
+}
+
+func (s *Server) internal(ctx context.Context, tool string, err error) *rpcError {
+	s.logger.ErrorContext(ctx, "mcp tool call failed", slog.String("tool", tool), slog.Any("error", err))
+	return &rpcError{Code: CodeInternalError, Message: s.internalMsg}
+}
+
+// render turns a handler's Result into the tools/call result. The text block
+// is written HERE, from the count and the tool's noun, and nowhere else.
+func (s *Server) render(ctx context.Context, t *Tool, res Result) (any, *rpcError) {
+	switch res.kind {
+	case resultNotFound:
+		return toolResult{Content: []textContent{{Type: "text", Text: notFoundText}}, IsError: true}, nil
+	case resultStructured:
+		if res.count < 0 {
+			return nil, s.internal(ctx, t.spec.Name, fmt.Errorf("mcp: Structured count %d is negative", res.count))
+		}
+		data, err := json.Marshal(res.data)
+		if err != nil {
+			return nil, s.internal(ctx, t.spec.Name, fmt.Errorf("mcp: marshal structuredContent: %w", err))
+		}
+		if trimmed := bytes.TrimSpace(data); len(trimmed) == 0 || trimmed[0] != '{' {
+			return nil, s.internal(ctx, t.spec.Name, errors.New("mcp: structuredContent must marshal to a JSON object"))
+		}
+		return toolResult{
+			Content:           []textContent{{Type: "text", Text: successText(res.count, t.spec.Noun)}},
+			StructuredContent: data,
+		}, nil
+	default:
+		return nil, s.internal(ctx, t.spec.Name, errors.New("mcp: handler returned the zero Result with a nil error"))
+	}
+}

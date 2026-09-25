@@ -13,6 +13,51 @@ and it has its own section.
 
 ### Added
 
+- **`mcp`: a new package -- a read-only MCP tool server, hardened by
+  default.** Extracted from the two hand-rolled servers in the house (nagus
+  `cmd/nagus/mcp.go`, `package main` and so unimportable; quark
+  `internal/mcp`, a marked temporary copy of it). JSON-RPC 2.0 over one HTTP
+  POST: `initialize`, `ping`, `tools/list`, `tools/call`; notifications are
+  answered 202 with no body and never dispatched; batches are refused with
+  -32600; GET is 405.
+
+  The nagus-w1p and quark hardening is the API's shape rather than a
+  convention. A handler returns `Structured(count, object)` or `NotFound()` and
+  cannot supply text: the library writes the text block from the count and a
+  noun fixed at registration, so no structured value and no caller argument can
+  reach it. A handler error is logged and answered with a fixed
+  `Options.InternalErrorMessage` unless it is an `InvalidArgument(Message)`,
+  whose `Message` type makes a runtime-built string a compile error without an
+  explicit conversion. Protocol errors do not echo the method, the tool name or
+  the decoder's message. Arguments are decoded with unknown fields rejected at
+  every depth, keys matched case-sensitively, `required` enforced, and the
+  schema's `additionalProperties` forced to false; `New` refuses a schema whose
+  properties differ from the argument struct's JSON fields. Tools are
+  read-only unless `ToolSpec.Mutating` AND `Options.AllowMutatingTools` are
+  set, and tools/list advertises `annotations.readOnlyHint`. Handler panics
+  become internal errors. Bodies are capped (`DefaultMaxBodyBytes`, 413).
+
+  New: `New`, `Options`, `Server` (`ServeHTTP`, `ToolNames`), `NewTool`,
+  `ToolSpec`, `Tool` (`Name`), `Result`, `Structured`, `NotFound`,
+  `InvalidArgument`, `Message`, `SupportedProtocolVersions`,
+  `DefaultProtocolVersion`, `DefaultMaxBodyBytes`,
+  `DefaultInternalErrorMessage`, `DefaultNoun`, and the `Code*` JSON-RPC error
+  codes.
+
+  **Adoption** (follow-up MRs in each service, not part of this change): one
+  `NewTool` per tool, one `New`, mounted with `api.RawRoute("POST /mcp", srv)`;
+  delete the vendored core. Two differences a service's tests may notice:
+  `initialize` answers with the client's `protocolVersion` only if it is in
+  `SupportedProtocolVersions()` (otherwise the default), and error messages no
+  longer name the unknown method or tool. See the README and the package doc.
+
+- **ADR 0001 (Proposed): a SQLite adapter for the kit.**
+  [`docs/adr/0001-sqlite-adapter.md`](docs/adr/0001-sqlite-adapter.md) weighs
+  no kit code, an in-module `sqlitekit` open/migrate/error-classification
+  package, the same as a nested module, a generic SQLite `Store`, and a
+  driver-free helper, and recommends the in-module package. No code yet; the
+  operator decides.
+
 - **`httpapi`: a single-port TRANSITION MODE.** `AdminHandlers(AdminOptions)
   map[string]http.Handler`, `(*Admin).Handlers()` and `(*Admin).RegisterOn(mux)`
   mount the admin routes on an existing mux -- including the API listener's --
