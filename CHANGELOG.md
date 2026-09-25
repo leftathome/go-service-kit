@@ -32,24 +32,41 @@ and it has its own section.
   the decoder's message. Arguments are decoded with unknown fields rejected at
   every depth, keys matched case-sensitively, `required` enforced, and the
   schema's `additionalProperties` forced to false; `New` refuses a schema whose
-  properties differ from the argument struct's JSON fields. Tools are
-  read-only unless `ToolSpec.Mutating` AND `Options.AllowMutatingTools` are
-  set, and tools/list advertises `annotations.readOnlyHint`. Handler panics
-  become internal errors. Bodies are capped (`DefaultMaxBodyBytes`, 413).
+  top-level properties differ from the argument struct's JSON fields; the
+  advertised schema is a deep copy. Every tool must declare `ToolSpec.Access`
+  (`ReadOnly` or `Mutating`; the zero value `AccessUnset` is refused, so a
+  forgotten flag cannot advertise a write as read-only), a `Mutating` tool
+  also needs `Options.AllowMutatingTools`, and tools/list advertises
+  `annotations.readOnlyHint`. Panics in a handler or in the MarshalJSON of
+  its data become internal errors, logged with the stack. A browser `Origin`
+  not in `Options.AllowedOrigins` is refused with 403 (DNS-rebinding guard the
+  transport spec requires). Bodies are capped (`DefaultMaxBodyBytes`, 413).
+  Only protocol 2025-06-18 is agreed to: earlier versions have no
+  structuredContent, so an older client would get a count and no data.
 
   New: `New`, `Options`, `Server` (`ServeHTTP`, `ToolNames`), `NewTool`,
-  `ToolSpec`, `Tool` (`Name`), `Result`, `Structured`, `NotFound`,
-  `InvalidArgument`, `Message`, `SupportedProtocolVersions`,
-  `DefaultProtocolVersion`, `DefaultMaxBodyBytes`,
-  `DefaultInternalErrorMessage`, `DefaultNoun`, and the `Code*` JSON-RPC error
-  codes.
+  `ToolSpec`, `Tool` (`Name`), `Access` (`AccessUnset`, `ReadOnly`,
+  `Mutating`), `Result`, `Structured`, `NotFound`, `InvalidArgument`,
+  `Message`, `SupportedProtocolVersions`, `DefaultProtocolVersion`,
+  `DefaultMaxBodyBytes`, `DefaultInternalErrorMessage`, `DefaultNoun`, and the
+  `Code*` JSON-RPC error codes.
 
   **Adoption** (follow-up MRs in each service, not part of this change): one
   `NewTool` per tool, one `New`, mounted with `api.RawRoute("POST /mcp", srv)`;
-  delete the vendored core. Two differences a service's tests may notice:
-  `initialize` answers with the client's `protocolVersion` only if it is in
-  `SupportedProtocolVersions()` (otherwise the default), and error messages no
-  longer name the unknown method or tool. See the README and the package doc.
+  delete the vendored core. Behaviour changes a service's tests will notice,
+  versus nagus's and quark's hand-rolled servers:
+  - a request without `"jsonrpc": "2.0"` is -32600 (was not checked);
+  - a missing `required` argument is refused before the handler runs, with
+    "invalid arguments: unknown, missing or malformed field" (was the
+    handler's own "id is required");
+  - an oversized body is HTTP 413 with -32600 (quark: HTTP 200 with -32700);
+  - unknown methods and tools are not named in the error message;
+  - the text blocks are the library's wording, not the service's -- keep a
+    service-specific sentence with `ToolSpec.Note`; not-found is "Nothing
+    matched the request. No data is returned.";
+  - initialize offers only 2025-06-18 (was: echo any string);
+  - a browser `Origin` not in `Options.AllowedOrigins` is 403.
+  See the README and the package doc.
 
 - **ADR 0001 (Proposed): a SQLite adapter for the kit.**
   [`docs/adr/0001-sqlite-adapter.md`](docs/adr/0001-sqlite-adapter.md) weighs

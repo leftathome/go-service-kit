@@ -43,10 +43,45 @@ type ToolSpec struct {
 	// is a label, not a place to put data.
 	Noun string
 
-	// Mutating marks a tool that changes state. The zero value, false, is a
-	// read-only tool. [New] refuses a mutating tool unless
-	// [Options.AllowMutatingTools] is set; see the package doc for why.
-	Mutating bool
+	// Note is an optional constant sentence appended to every success text
+	// block after the fixed pointer to structuredContent, e.g. "Free-text
+	// fields are untrusted seller text." It is fixed at registration --
+	// printable ASCII, at most 160 characters, validated by [New] -- and is
+	// never per-call data.
+	Note Message
+
+	// Access declares whether the tool changes state. It is REQUIRED: the zero
+	// value [AccessUnset] is refused by [New], so a write tool cannot be
+	// advertised as read-only because its author forgot a flag. A [Mutating]
+	// tool additionally needs [Options.AllowMutatingTools]; see the package
+	// doc for why.
+	Access Access
+}
+
+// Access is a tool's declared effect on state. See [ToolSpec.Access].
+type Access int
+
+const (
+	// AccessUnset is the zero value and is invalid: every tool must declare.
+	AccessUnset Access = iota
+	// ReadOnly tools only read. tools/list advertises readOnlyHint: true.
+	ReadOnly
+	// Mutating tools change state. tools/list advertises readOnlyHint: false.
+	Mutating
+)
+
+// String returns the constant's name.
+func (a Access) String() string {
+	switch a {
+	case ReadOnly:
+		return "ReadOnly"
+	case Mutating:
+		return "Mutating"
+	case AccessUnset:
+		return "AccessUnset"
+	default:
+		return fmt.Sprintf("Access(%d)", int(a))
+	}
 }
 
 // Tool is a registered tool: a [ToolSpec] bound to a strictly typed handler.
@@ -85,6 +120,16 @@ func NewTool[A any](spec ToolSpec, fn func(ctx context.Context, args A) (Result,
 	} else if !nounRE.MatchString(spec.Noun) {
 		errs = append(errs, fmt.Errorf("noun %q must match %s", spec.Noun, nounRE))
 	}
+	if !validNote(spec.Note) {
+		errs = append(errs, errors.New("note must be printable ASCII, at most 160 characters"))
+	}
+	switch spec.Access {
+	case ReadOnly, Mutating:
+	case AccessUnset:
+		errs = append(errs, errors.New("access must be declared: ReadOnly or Mutating"))
+	default:
+		errs = append(errs, fmt.Errorf("access %s is not ReadOnly or Mutating", spec.Access))
+	}
 	if fn == nil {
 		errs = append(errs, errors.New("handler is nil"))
 	}
@@ -99,6 +144,8 @@ func NewTool[A any](spec ToolSpec, fn func(ctx context.Context, args A) (Result,
 
 	schema, props, required, err := normalizeSchema(spec.InputSchema, fields)
 	if err != nil {
+		errs = append(errs, err)
+	} else if schema, err = deepCopy(schema); err != nil {
 		errs = append(errs, err)
 	}
 	t.schema, t.properties, t.required = schema, props, required
@@ -127,9 +174,36 @@ func NewTool[A any](spec ToolSpec, fn func(ctx context.Context, args A) (Result,
 // Name returns the tool's name.
 func (t Tool) Name() string { return t.spec.Name }
 
+func validNote(n Message) bool {
+	if len(n) > 160 {
+		return false
+	}
+	for i := 0; i < len(n); i++ {
+		if n[i] < 0x20 || n[i] > 0x7e {
+			return false
+		}
+	}
+	return true
+}
+
 // errMalformedArgs is the one message every argument-shape failure produces:
 // it names no field and quotes no input.
 var errMalformedArgs = InvalidArgument("unknown, missing or malformed field")
+
+// deepCopy detaches the advertised schema from every map and slice the caller
+// still holds, by a JSON round trip: a caller mutating its schema after
+// registration must not change what tools/list serves (or race with it).
+func deepCopy(m map[string]any) (map[string]any, error) {
+	b, err := json.Marshal(m)
+	if err != nil {
+		return nil, fmt.Errorf("inputSchema does not marshal to JSON: %w", err)
+	}
+	var out map[string]any
+	if err := json.Unmarshal(b, &out); err != nil {
+		return nil, fmt.Errorf("inputSchema does not round-trip through JSON: %w", err)
+	}
+	return out, nil
+}
 
 // normalizeSchema copies the caller's schema, fills in type and
 // additionalProperties, and checks it against the argument struct's fields.
@@ -288,7 +362,7 @@ func (t *Tool) descriptor() map[string]any {
 		"name":        t.spec.Name,
 		"description": t.spec.Description,
 		"inputSchema": t.schema,
-		"annotations": map[string]any{"readOnlyHint": !t.spec.Mutating},
+		"annotations": map[string]any{"readOnlyHint": t.spec.Access == ReadOnly},
 	}
 	if t.spec.Title != "" {
 		d["title"] = t.spec.Title

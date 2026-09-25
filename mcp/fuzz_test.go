@@ -11,6 +11,28 @@ import (
 	"github.com/leftathome/go-service-kit/mcp"
 )
 
+// knownErrorMessages is every error message the fuzz server can produce: the
+// library's fixed protocol messages plus the fixture's InvalidArgument
+// constants. Anything else means input reached an error message.
+var knownErrorMessages = map[string]bool{
+	"parse error: request body unreadable":                   true,
+	"parse error: empty body":                                true,
+	"parse error: body is not valid JSON":                    true,
+	"invalid request: body too large":                        true,
+	"invalid request: batch requests are not supported":      true,
+	"invalid request: body must be a JSON object":            true,
+	"invalid request: id must be a string, a number or null": true,
+	`invalid request: jsonrpc must be "2.0"`:                 true,
+	"invalid request: method must be a non-empty string":     true,
+	"method not found":                                       true,
+	"invalid params: expected {name, arguments}":             true,
+	"unknown tool": true,
+	"invalid arguments: unknown, missing or malformed field": true,
+	string(mcp.DefaultInternalErrorMessage):                  true,
+	"invalid arguments: id is required":                      true,
+	"invalid arguments: limit must be >= 0":                  true,
+}
+
 // FuzzServeHTTP: whatever arrives, the server answers 200 with one well-formed
 // JSON-RPC response, 202 with no body, or 413; and no response ever contains
 // the planted probe outside structuredContent.
@@ -60,8 +82,8 @@ func FuzzServeHTTP(f *testing.F) {
 		if (env.Error == nil) == (env.Result == nil) {
 			t.Fatalf("response must carry exactly one of result and error: %q", rec.Body.String())
 		}
-		if env.Error != nil && strings.Contains(env.Error.Message, "IGNORE") {
-			t.Fatalf("error echoes the probe: %q", env.Error.Message)
+		if env.Error != nil && !knownErrorMessages[env.Error.Message] {
+			t.Fatalf("error message %q is not one of the library's or the fixture's constants", env.Error.Message)
 		}
 		var res struct {
 			Content []struct {
