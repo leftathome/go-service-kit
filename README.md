@@ -77,7 +77,7 @@ Apache 2.0.
 ## Install
 
 ```bash
-go get github.com/leftathome/go-service-kit@v0.1.0
+go get github.com/leftathome/go-service-kit@v0.3.0
 ```
 
 See [CHANGELOG.md](CHANGELOG.md) for what is in this release and the verified
