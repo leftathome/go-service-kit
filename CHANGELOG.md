@@ -6,6 +6,18 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **A GitLab pipeline** (`.gitlab-ci.yml`: lint -> test -> vulncheck, each a
+  `make` target, the same targets the GitHub workflow calls). The kit had
+  none, so MRs on the primary forge merged ungated and a red vulncheck on
+  main went unseen.
+
+### Security
+
+- **grpc bumped past GO-2026-6348** (a DoS reachable through obs's OTLP
+  exporter; gsk-s7j). `make vulncheck` is green again.
+
 Ergonomic gaps found by nagus, the kit's first real consumer, while planning
 its migration. Everything below is additive at the API level: v0.1.2 code keeps
 compiling. There is exactly one behaviour change -- `obs.DefaultRedactKeys` --
