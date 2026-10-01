@@ -70,6 +70,11 @@ vulncheck: mod-download $(GOVULNCHECK_INSTALL) ## Check the dependency graph aga
 # the build and the tests import, so with a warm cache it needs no network at
 # all. `go mod download` also wants modules nothing here compiles, and so fails
 # offline on a tree that builds and tests fine.
+#
+# The wrapper cannot tell a failed download from any other failure of these
+# commands. A missing go.sum entry or an import that does not resolve is
+# therefore retried as well, and fails all the same about two minutes later,
+# with go's own message and exit status.
 mod-download: ## Fetch the modules the build and tests need, retrying a failed download
 	$(RETRY) go list -deps -test ./... >/dev/null
 
