@@ -16,10 +16,14 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `go install` the pinned tool into `bin/tools`, and `test`, `lint` and
   `vulncheck` fetch the module graph (`make mod-download`), through
   `scripts/retry.sh` -- 4 attempts, 10s/30s/90s waits, 600s per attempt,
-  1200s in total -- and then run the tool once, unwrapped. A lint finding, a
-  failing test or a real vulnerability still fails on the first run.
-  `scripts/retry_test.go` tests the helper and drives the Makefile with a
-  fake toolchain to hold that line. Tooling only: no package of the library
+  1200s in total -- and then run the tool once, unwrapped. Only a failure
+  that looks like a failed fetch is retried; anything else fails at once. A
+  lint finding, a failing test or a real vulnerability still fails on the
+  first run. The install is skipped when `bin/tools` already holds the pinned
+  version built with the toolchain in use, so the gates run offline once the
+  tools are there. `scripts/retry_test.go` tests the helper and drives the
+  Makefile with a fake toolchain to hold that line; `.golangci.yml` excludes
+  gosec for that one file. Tooling only: no package of the library
   changes, and `scripts` holds tests, nothing importable.
 
 ## [0.3.0] - 2026-09-26

@@ -23,14 +23,19 @@ GOVULNCHECK_VERSION    ?= v1.6.0
 # re-rolled. scripts/retry_test.go drives these targets with a fake toolchain
 # and fails if a verdict is ever retried.
 RETRY     ?= sh scripts/retry.sh
-TOOLS_BIN ?= $(CURDIR)/bin/tools
+
+# RELATIVE on purpose. The recipes run from the repository root, and a tool
+# invoked as bin/tools/<name> still works when the checkout's path has a space
+# in it; an absolute path pasted into a recipe does not. Only GOBIN needs the
+# absolute form, and the install recipe builds that itself, quoted.
+TOOLS_BIN := bin/tools
 
 # Prefer a golangci-lint already on PATH (fast, offline); fall back to the
 # pinned module. Without the fallback `make lint` passes on a developer box and
 # fails on a runner that has no golangci-lint installed -- which is exactly how
 # this repo's GitHub CI was red from its first commit while every local run
 # looked green. Both CIs call `make lint`, so the resolution belongs here, once.
-GOLANGCI_LINT ?= $(shell command -v golangci-lint 2>/dev/null)
+GOLANGCI_LINT ?= $(if $(shell command -v golangci-lint 2>/dev/null),golangci-lint)
 ifeq ($(GOLANGCI_LINT),)
 GOLANGCI_LINT         = $(TOOLS_BIN)/golangci-lint
 GOLANGCI_LINT_INSTALL = install-golangci-lint
@@ -64,25 +69,44 @@ vulncheck: mod-download $(GOVULNCHECK_INSTALL) ## Check the dependency graph aga
 	$(GOVULNCHECK) ./...
 
 # The download steps. Everything that talks to the module proxy on behalf of a
-# gate lives in these three recipes, behind $(RETRY), and nothing else does.
+# gate lives in these recipes, behind $(RETRY), and nothing else does: the only
+# commands $(RETRY) may run are `go list` and `go install`, and
+# TestMakefileRetriesOnlyDownloads fails on anything else.
 #
 # `go list -deps -test`, not `go mod download`: it fetches exactly the modules
 # the build and the tests import, so with a warm cache it needs no network at
 # all. `go mod download` also wants modules nothing here compiles, and so fails
 # offline on a tree that builds and tests fine.
 #
-# The wrapper cannot tell a failed download from any other failure of these
-# commands. A missing go.sum entry or an import that does not resolve is
-# therefore retried as well, and fails all the same about two minutes later,
-# with go's own message and exit status.
+# Only a failure that looks like a failed fetch is retried (retry.sh says how
+# it tells). A missing go.sum entry or an import that does not resolve fails
+# at once, with go's own message and exit status.
 mod-download: ## Fetch the modules the build and tests need, retrying a failed download
 	$(RETRY) go list -deps -test ./... >/dev/null
 
+# $(call install-tool,<binary>,<package>,<version>) puts the pinned tool in
+# $(TOOLS_BIN) -- unless the binary already there is that package at that
+# version, built by the toolchain in use (`go version -m` reads all three out
+# of the binary). `go install pkg@version` asks the proxy which module provides
+# the package on EVERY run, warm cache or not, so without the check the gates
+# could not run offline and paid for a round trip they did not need. A changed
+# pin or a changed toolchain does not match, and reinstalls.
+define install-tool
+@have=$$(go version -m '$(TOOLS_BIN)/$(1)' 2>/dev/null | awk -v pkg='$(2)' \
+	'NR == 1 { gover = $$NF } $$1 == "path" && $$2 == pkg { found = 1 } $$1 == "mod" { ver = $$3 } END { if (found) print gover, ver }'); \
+if [ "$$have" = "$$(go env GOVERSION) $(3)" ]; then \
+	echo '$(1) $(3) is already in $(TOOLS_BIN)'; \
+else \
+	echo 'installing $(1) $(3) into $(TOOLS_BIN)'; \
+	GOBIN="$$(pwd)/$(TOOLS_BIN)" $(RETRY) go install $(2)@$(3); \
+fi
+endef
+
 install-golangci-lint:
-	GOBIN='$(TOOLS_BIN)' $(RETRY) go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@$(GOLANGCI_LINT_VERSION)
+	$(call install-tool,golangci-lint,github.com/golangci/golangci-lint/v2/cmd/golangci-lint,$(GOLANGCI_LINT_VERSION))
 
 install-govulncheck:
-	GOBIN='$(TOOLS_BIN)' $(RETRY) go install golang.org/x/vuln/cmd/govulncheck@$(GOVULNCHECK_VERSION)
+	$(call install-tool,govulncheck,golang.org/x/vuln/cmd/govulncheck,$(GOVULNCHECK_VERSION))
 
 tidy: ## Tidy go.mod/go.sum (the one target allowed to write them)
 	GOFLAGS=-mod=mod go mod tidy

@@ -5,10 +5,15 @@
 //
 //   - retry.sh itself: a download that fails and then succeeds is a success, one
 //     that never succeeds fails with its own exit status after a bounded number
-//     of attempts, and the time limits hold.
+//     of attempts, a failure that is not a download is not retried at all, and
+//     the time limits hold.
 //   - the Makefile's use of it: the DOWNLOAD of a tool is retried, the tool's
 //     VERDICT never is. Those tests run the real Makefile against a fake `go`
 //     that fails on demand and installs a fake tool that records every call.
+//
+// This file writes executable fixtures and runs them, which is everything
+// gosec exists to flag; .golangci.yml excludes gosec for this one file rather
+// than have it carry a nolint directive per call.
 package scripts
 
 import (
@@ -16,21 +21,42 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"strings"
 	"testing"
 	"time"
 )
 
+// A network failure as cmd/go prints it: the request that failed in the
+// incident this all started from.
+const fetchFailure = `go: golang.org/x/vuln/cmd/govulncheck@v1.6.0: Get "https://proxy.golang.org/golang.org/x/vuln/cmd/govulncheck/@v/v1.6.0.info": net/http: TLS handshake timeout`
+
 // flaky is a command that fails with status $2 until it has been run more
-// than $1 times, counting its runs in ./runs. A third argument of "hang" makes
-// a failing run sleep instead of exiting.
+// than $1 times, counting its runs in ./runs. A failing run prints $FLAKY_MSG
+// (default: a fetch failure) to stderr -- unless a third argument says how to
+// overstay instead: "hang" sleeps, "stubborn" sleeps ignoring SIGTERM, "polite"
+// sleeps and exits 0 when it gets SIGTERM.
 const flaky = `#!/bin/sh
 echo run >>runs
 n=$(wc -l <runs)
 [ "$n" -gt "$1" ] && exit 0
-[ "${3:-}" = hang ] && exec sleep 60
-echo "flaky: net/http: TLS handshake timeout" >&2
+case "${3:-}" in
+hang) exec sleep 60 ;;
+stubborn)
+	trap '' TERM
+	exec sleep 60
+	;;
+polite)
+	trap 'exit 0' TERM
+	i=0
+	while [ "$i" -lt 600 ]; do
+		sleep 0.1
+		i=$((i + 1))
+	done
+	;;
+esac
+echo "${FLAKY_MSG:-$FLAKY_DEFAULT_MSG}" >&2
 exit "$2"
 `
 
@@ -41,37 +67,85 @@ echo "$1" >>"$SLEEP_LOG"
 `
 
 // fakeGo stands in for the go command under make. Every call is appended to
-// $FAKE_DIR/go.log. `go <verb>` fails while $FAKE_DIR/<verb>.fails holds a
-// number above zero (counting it down), then exits with $FAKE_DIR/<verb>.exit
-// (default 0). A successful `go install` writes a fake tool into $GOBIN that
-// logs its own calls to $FAKE_DIR/tool.log and exits with $FAKE_DIR/tool.exit.
+// $FAKE_DIR/go.log.
+//
+//   - `go env GOVERSION` prints $FAKE_DIR/goversion (default go1.26.6).
+//   - `go version -m <binary>` prints what a successful install recorded next
+//     to that binary, in the real command's format.
+//   - any other `go <verb>` fails while $FAKE_DIR/<verb>.fails holds a number
+//     above zero (counting it down), printing $FAKE_DIR/<verb>.msg (default: a
+//     fetch failure); then it exits with $FAKE_DIR/<verb>.exit (default 0).
+//   - a successful `go install pkg@version` writes a fake tool into $GOBIN that
+//     logs its own calls to $FAKE_DIR/tool.log and exits with
+//     $FAKE_DIR/tool.exit.
+//
+// A failing VERDICT (the tool, or go vet / go test via <verb>.exit) also prints
+// a fetch-failure line. That is the worst case for the rule under test: a real
+// scan can die mentioning the network, and put behind the retry it WOULD be
+// retried. The run counts in the tests below catch exactly that.
 const fakeGo = `#!/bin/sh
 echo "go $*" >>"$FAKE_DIR/go.log"
 verb=$1
+gover=$(cat "$FAKE_DIR/goversion" 2>/dev/null || echo go1.26.6)
+case "$verb" in
+env)
+	echo "$gover"
+	exit 0
+	;;
+version)
+	cat "$3.meta" 2>/dev/null
+	exit
+	;;
+esac
 left=$(cat "$FAKE_DIR/$verb.fails" 2>/dev/null || echo 0)
 if [ "$left" -gt 0 ]; then
 	echo $((left - 1)) >"$FAKE_DIR/$verb.fails"
-	echo "fake go $verb: net/http: TLS handshake timeout" >&2
+	cat "$FAKE_DIR/$verb.msg" >&2 2>/dev/null || echo "$FAKE_DEFAULT_MSG" >&2
 	exit 1
 fi
 if [ "$verb" = install ]; then
-	name=${2##*/}
-	name=${name%%@*}
+	pkg=${2%@*}
+	name=${pkg##*/}
 	mkdir -p "$GOBIN"
 	cat >"$GOBIN/$name" <<TOOL
 #!/bin/sh
 echo "$name \$*" >>"$FAKE_DIR/tool.log"
-exit \$(cat "$FAKE_DIR/tool.exit" 2>/dev/null || echo 0)
+rc=\$(cat "$FAKE_DIR/tool.exit" 2>/dev/null || echo 0)
+[ "\$rc" = 0 ] || echo "\$FAKE_DEFAULT_MSG" >&2
+exit "\$rc"
 TOOL
 	chmod +x "$GOBIN/$name"
+	printf '%s: %s\n\tpath\t%s\n\tmod\t%s\t%s\th1:fake=\n' \
+		"$GOBIN/$name" "$gover" "$pkg" "$pkg" "${2##*@}" >"$GOBIN/$name.meta"
 fi
-exit "$(cat "$FAKE_DIR/$verb.exit" 2>/dev/null || echo 0)"
+rc=$(cat "$FAKE_DIR/$verb.exit" 2>/dev/null || echo 0)
+[ "$rc" = 0 ] || echo "$FAKE_DEFAULT_MSG" >&2
+exit "$rc"
 `
 
 // fakeLint is a golangci-lint found on PATH: it logs like an installed tool.
 const fakeLint = `#!/bin/sh
 echo "golangci-lint $*" >>"$FAKE_DIR/tool.log"
-exit "$(cat "$FAKE_DIR/tool.exit" 2>/dev/null || echo 0)"
+rc=$(cat "$FAKE_DIR/tool.exit" 2>/dev/null || echo 0)
+[ "$rc" = 0 ] || echo "$FAKE_DEFAULT_MSG" >&2
+exit "$rc"
+`
+
+// passThroughTimeout is a timeout(1) of the kind that reports the COMMAND's
+// exit status when it kills it (busybox with -k behaves so): no --foreground,
+// SIGTERM at the limit, and whatever the command then exits with.
+const passThroughTimeout = `#!/bin/sh
+[ "$1" = --foreground ] && exit 1
+[ "$1" = -k ] && shift 2
+secs=$1
+shift
+"$@" &
+pid=$!
+(
+	sleep "$secs"
+	kill -TERM "$pid" 2>/dev/null
+) >/dev/null 2>&1 &
+wait "$pid"
 `
 
 func needShell(t *testing.T) {
@@ -98,7 +172,7 @@ func writeFile(t *testing.T, path, content string, mode os.FileMode) {
 	if err := os.MkdirAll(filepath.Dir(path), 0o750); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(path, []byte(content), mode); err != nil { //nolint:gosec // G306: test fixtures under t.TempDir, some executable
+	if err := os.WriteFile(path, []byte(content), mode); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -106,7 +180,7 @@ func writeFile(t *testing.T, path, content string, mode os.FileMode) {
 // lines returns the non-empty lines of a log file, or nil if it is absent.
 func lines(t *testing.T, path string) []string {
 	t.Helper()
-	raw, err := os.ReadFile(path) //nolint:gosec // G304: under t.TempDir
+	raw, err := os.ReadFile(path)
 	if errors.Is(err, os.ErrNotExist) {
 		return nil
 	}
@@ -152,10 +226,12 @@ func runRetry(t *testing.T, env []string, args ...string) (code int, out, dir st
 	needShell(t)
 	dir = t.TempDir()
 	writeFile(t, filepath.Join(dir, "flaky"), flaky, 0o700)
-	cmd := exec.CommandContext(t.Context(), "sh", append([]string{retryScript(t)}, args...)...) //nolint:gosec // G204: fixed script, test-chosen arguments
+	cmd := exec.CommandContext(t.Context(), "sh", append([]string{retryScript(t)}, args...)...)
 	cmd.Dir = dir
 	// Blank any RETRY_* setting this process inherited, so only env decides.
-	cmd.Env = append(os.Environ(), "RETRY_ATTEMPTS=", "RETRY_DELAY=", "RETRY_ATTEMPT_TIMEOUT=", "RETRY_BUDGET=")
+	cmd.Env = append(os.Environ(),
+		"RETRY_ATTEMPTS=", "RETRY_DELAY=", "RETRY_ATTEMPT_TIMEOUT=", "RETRY_BUDGET=", "RETRY_PATTERN=",
+		"FLAKY_MSG=", "FLAKY_DEFAULT_MSG="+fetchFailure)
 	cmd.Env = append(cmd.Env, env...)
 	raw, err := cmd.CombinedOutput()
 	return exitCode(t, err), string(raw), dir
@@ -186,6 +262,7 @@ func TestRetryFailingThenSucceedingSucceeds(t *testing.T) {
 	for _, want := range []string{
 		"retry: attempt 1/4 failed (exit 1), retrying in 0s: ./flaky 2 1",
 		"retry: attempt 2/4 failed (exit 1), retrying in 0s: ./flaky 2 1",
+		fetchFailure, // the command's own stderr is still shown
 	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("missing log line %q in:\n%s", want, out)
@@ -225,32 +302,147 @@ func TestRetryDefaultBackoff(t *testing.T) {
 	}
 }
 
+// Only a failure that looks like a failed fetch is worth waiting on. Each
+// message is what the always-failing command prints; it is retried or it
+// fails at once.
+func TestRetryOnlyRetriesWhatLooksLikeAFailedDownload(t *testing.T) {
+	t.Parallel()
+	for name, tc := range map[string]struct {
+		msg     string
+		pattern string
+		retried bool
+	}{
+		"TLS handshake timeout on the path query": {msg: fetchFailure, retried: true},
+		"dial timeout":                {msg: `Get "http://127.0.0.1:9/x/@v/v1.info": dial tcp 127.0.0.1:9: i/o timeout`, retried: true},
+		"proxy 502":                   {msg: `go: example.com/m@v1.0.0: reading https://proxy.golang.org/example.com/m/@v/v1.0.0.zip: 502 Bad Gateway`, retried: true},
+		"connection reset":            {msg: `read tcp 10.0.0.1:1234->142.250.0.1:443: read: connection reset by peer`, retried: true},
+		"DNS failure":                 {msg: `dial tcp: lookup proxy.golang.org: no such host`, retried: true},
+		"truncated body":              {msg: `go: downloading example.com/m v1.0.0: unexpected EOF`, retried: true},
+		"git cannot resolve the host": {msg: `fatal: unable to access 'https://example.com/m/': Could not resolve host: example.com`, retried: true},
+
+		"missing go.sum entry":          {msg: `missing go.sum entry for module providing package example.com/m; to add it: go get example.com/m`},
+		"cross-compiled install":        {msg: `go: cannot install cross-compiled binaries when GOBIN is set`},
+		"version that does not exist":   {msg: `go: example.com/m@v9.9.9: reading https://proxy.golang.org/example.com/m/@v/v9.9.9.info: 404 Not Found`},
+		"import that does not resolve":  {msg: `package example.com/nope is not in std`},
+		"checksum mismatch":             {msg: `verifying example.com/m@v1.0.0: checksum mismatch`},
+		"compile error in the tool":     {msg: `./main.go:3:1: syntax error: non-declaration statement outside function body`},
+		"RETRY_PATTERN widens the list": {msg: `missing go.sum entry for module providing package example.com/m`, pattern: `go\.sum`, retried: true},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			code, out, dir := runRetry(t, []string{
+				"RETRY_DELAY=0", "RETRY_ATTEMPTS=2", "FLAKY_MSG=" + tc.msg, "RETRY_PATTERN=" + tc.pattern,
+			}, "./flaky", "99", "5")
+			want := 1
+			if tc.retried {
+				want = 2
+			}
+			if code != 5 || runs(t, dir) != want {
+				t.Errorf("exit %d after %d runs, want 5 after %d\n%s", code, runs(t, dir), want, out)
+			}
+			if !tc.retried && !strings.Contains(out, "retry: not retrying, this does not look like a failed download (exit 5)") {
+				t.Errorf("missing the not-retrying line in:\n%s", out)
+			}
+		})
+	}
+}
+
 func TestRetryDoesNotRetryAMissingCommand(t *testing.T) {
 	t.Parallel()
 	code, out, _ := runRetry(t, []string{"RETRY_DELAY=0"}, "./no-such-command")
-	if code != 127 {
-		t.Errorf("exit %d, want 127\n%s", code, out)
+	if code != 126 && code != 127 {
+		t.Errorf("exit %d, want 126 or 127\n%s", code, out)
 	}
-	if strings.Contains(out, "retrying in") || !strings.Contains(out, "retry: not retrying") {
+	if strings.Contains(out, "retrying in") || !strings.Contains(out, "retry: not retrying, the command cannot be run") {
 		t.Errorf("a missing command must fail at once, got:\n%s", out)
 	}
 }
 
-func TestRetryKillsAHungAttempt(t *testing.T) {
+// timeoutFlavors returns a PATH for each timeout(1) available here: the one
+// already on PATH (coreutils on the CI images) and busybox's, which reports a
+// killed command differently and is what an alpine-based image would have.
+func timeoutFlavors(t *testing.T) map[string]string {
+	t.Helper()
+	flavors := map[string]string{}
+	if _, err := exec.LookPath("timeout"); err == nil {
+		flavors["timeout on PATH"] = os.Getenv("PATH")
+	}
+	if bb, err := exec.LookPath("busybox"); err == nil {
+		dir := t.TempDir()
+		if err := os.Symlink(bb, filepath.Join(dir, "timeout")); err != nil {
+			t.Fatal(err)
+		}
+		flavors["busybox timeout"] = dir + string(os.PathListSeparator) + os.Getenv("PATH")
+	}
+	if len(flavors) == 0 {
+		t.Skip("no timeout(1) here; retry.sh cannot bound a hung attempt")
+	}
+	return flavors
+}
+
+// An attempt that overstays its limit is killed and counted as a failed
+// fetch, whatever it does about the signal: it is retried, it is never
+// reported as a success, and the log says it was killed.
+func TestRetryKillsAnAttemptThatOverstays(t *testing.T) {
 	t.Parallel()
-	if _, err := exec.LookPath("timeout"); err != nil {
-		t.Skip("no timeout(1) on PATH; retry.sh cannot bound a hung attempt here")
+	for flavor, path := range timeoutFlavors(t) {
+		for mode, wantRuns := range map[string]int{
+			"hang":     2, // dies on SIGTERM; the second attempt succeeds
+			"polite":   2, // exits 0 on SIGTERM: still a failure, still retried
+			"stubborn": 2, // ignores SIGTERM: SIGKILL follows
+		} {
+			t.Run(flavor+"/"+mode, func(t *testing.T) {
+				t.Parallel()
+				start := time.Now()
+				code, out, dir := runRetry(t, []string{"PATH=" + path, "RETRY_DELAY=0", "RETRY_ATTEMPT_TIMEOUT=2"},
+					"./flaky", "1", "1", mode)
+				if code != 0 || runs(t, dir) != wantRuns {
+					t.Fatalf("exit %d after %d runs, want 0 after %d\n%s", code, runs(t, dir), wantRuns, out)
+				}
+				if !regexp.MustCompile(`attempt 1/4 failed \(killed after 2s, exit [1-9][0-9]*\)`).MatchString(out) {
+					t.Errorf("the overstaying attempt was not reported as killed with a failing status:\n%s", out)
+				}
+				if d := time.Since(start); d > 40*time.Second {
+					t.Errorf("took %s; the 60s sleep was not cut short", d)
+				}
+			})
+		}
 	}
-	start := time.Now()
-	code, out, dir := runRetry(t, []string{"RETRY_DELAY=0", "RETRY_ATTEMPT_TIMEOUT=1"}, "./flaky", "1", "1", "hang")
-	if code != 0 || runs(t, dir) != 2 {
-		t.Fatalf("exit %d after %d runs, want 0 after 2\n%s", code, runs(t, dir), out)
+}
+
+// A killed LAST attempt must fail the step even if the command exited 0 on
+// its way out.
+func TestRetryNeverReportsAKilledAttemptAsSuccess(t *testing.T) {
+	t.Parallel()
+	flavors := timeoutFlavors(t)
+	bin := t.TempDir()
+	writeFile(t, filepath.Join(bin, "timeout"), passThroughTimeout, 0o700)
+	flavors["timeout that passes the command's status on"] = bin + string(os.PathListSeparator) + os.Getenv("PATH")
+	for flavor, path := range flavors {
+		t.Run(flavor, func(t *testing.T) {
+			t.Parallel()
+			code, out, dir := runRetry(t, []string{"PATH=" + path, "RETRY_ATTEMPTS=1", "RETRY_ATTEMPT_TIMEOUT=1"},
+				"./flaky", "99", "1", "polite")
+			if code == 0 || runs(t, dir) != 1 {
+				t.Errorf("exit %d after %d runs, want a failure after 1\n%s", code, runs(t, dir), out)
+			}
+			if !strings.Contains(out, "giving up after 1/1 attempts (killed after 1s, exit") {
+				t.Errorf("missing the killed line in:\n%s", out)
+			}
+		})
 	}
-	if !strings.Contains(out, "attempt 1/4 failed (killed after 1s)") {
-		t.Errorf("the hung attempt was not reported as killed:\n%s", out)
+}
+
+// 124 is what coreutils timeout returns for a kill, but a command may exit
+// 124 on its own account, and then nothing was killed.
+func TestRetryReportsACommandsOwn124AsAnExit(t *testing.T) {
+	t.Parallel()
+	code, out, dir := runRetry(t, []string{"RETRY_DELAY=0", "RETRY_ATTEMPTS=2"}, "./flaky", "99", "124")
+	if code != 124 || runs(t, dir) != 2 {
+		t.Fatalf("exit %d after %d runs, want 124 after 2\n%s", code, runs(t, dir), out)
 	}
-	if d := time.Since(start); d > 30*time.Second {
-		t.Errorf("took %s; the 60s hang was not cut short", d)
+	if strings.Contains(out, "killed") || !strings.Contains(out, "giving up after 2/2 attempts (exit 124)") {
+		t.Errorf("a command's own exit 124 was reported as a kill:\n%s", out)
 	}
 }
 
@@ -267,25 +459,48 @@ func TestRetryStopsAtTheBudget(t *testing.T) {
 	}
 }
 
-func TestRetryRejectsBadUsage(t *testing.T) {
+// A setting the shell could misread -- octal, overflow, not a number -- is
+// refused before the command is run, never half-honoured.
+func TestRetryRejectsBadSettings(t *testing.T) {
 	t.Parallel()
-	for name, tc := range map[string]struct {
-		env  []string
-		args []string
-	}{
-		"no command":            {nil, nil},
-		"attempts not a number": {[]string{"RETRY_ATTEMPTS=many"}, []string{"./flaky", "0", "1"}},
-		"zero attempts":         {[]string{"RETRY_ATTEMPTS=0"}, []string{"./flaky", "0", "1"}},
-		"negative delay":        {[]string{"RETRY_DELAY=-1"}, []string{"./flaky", "0", "1"}},
-		"zero budget":           {[]string{"RETRY_BUDGET=0"}, []string{"./flaky", "0", "1"}},
+	huge := "99999999999999999999999"
+	for _, setting := range []string{
+		"RETRY_ATTEMPTS=many", "RETRY_ATTEMPTS=0", "RETRY_ATTEMPTS=-1", "RETRY_ATTEMPTS= 3", "RETRY_ATTEMPTS=1e3",
+		"RETRY_ATTEMPTS=08", "RETRY_ATTEMPTS=21", "RETRY_ATTEMPTS=" + huge,
+		"RETRY_DELAY=-1", "RETRY_DELAY=08", "RETRY_DELAY=010", "RETRY_DELAY=3601", "RETRY_DELAY=" + huge,
+		"RETRY_ATTEMPT_TIMEOUT=0", "RETRY_ATTEMPT_TIMEOUT=09", "RETRY_ATTEMPT_TIMEOUT=86401", "RETRY_ATTEMPT_TIMEOUT=" + huge,
+		"RETRY_BUDGET=0", "RETRY_BUDGET=08", "RETRY_BUDGET=86401", "RETRY_BUDGET=" + huge,
 	} {
-		t.Run(name, func(t *testing.T) {
+		t.Run(setting, func(t *testing.T) {
 			t.Parallel()
-			code, out, dir := runRetry(t, tc.env, tc.args...)
+			code, out, dir := runRetry(t, []string{setting}, "./flaky", "0", "1")
 			if code != 2 || runs(t, dir) != 0 {
 				t.Errorf("exit %d after %d runs, want 2 after 0\n%s", code, runs(t, dir), out)
 			}
+			name, _, _ := strings.Cut(setting, "=")
+			if !strings.Contains(out, "retry: "+name+" must be a whole number from ") {
+				t.Errorf("the refusal does not name %s:\n%s", name, out)
+			}
 		})
+	}
+}
+
+func TestRetryRejectsNoCommand(t *testing.T) {
+	t.Parallel()
+	code, out, _ := runRetry(t, nil)
+	if code != 2 || !strings.Contains(out, "usage: retry.sh") {
+		t.Errorf("exit %d, want 2 and the usage line\n%s", code, out)
+	}
+}
+
+// The limits of each range are themselves accepted.
+func TestRetryAcceptsTheLimitsOfEachRange(t *testing.T) {
+	t.Parallel()
+	code, out, dir := runRetry(t, []string{
+		"RETRY_ATTEMPTS=20", "RETRY_DELAY=3600", "RETRY_ATTEMPT_TIMEOUT=86400", "RETRY_BUDGET=86400",
+	}, "./flaky", "0", "1")
+	if code != 0 || runs(t, dir) != 1 {
+		t.Errorf("exit %d after %d runs, want 0 after 1\n%s", code, runs(t, dir), out)
 	}
 }
 
@@ -297,20 +512,21 @@ func TestRetryPassesArgumentsThrough(t *testing.T) {
 	}
 }
 
-// makeRun is one run of a real Makefile target against the fake toolchain.
-type makeRun struct {
-	code    int
-	out     string
-	goLog   []string // every `go ...` call, in order
-	toolLog []string // every call of an installed (or PATH) tool, in order
+// makeEnv is a scratch copy of the Makefile and retry.sh with a fake
+// toolchain beside it. Its PATH holds ONLY the fake go and the handful of
+// system commands the recipes use, so neither the real toolchain nor a
+// golangci-lint installed on this machine can take part. The copy lives in a
+// directory with a space in its name: every run doubles as a check that no
+// recipe splits a path.
+type makeEnv struct {
+	t                *testing.T
+	makeBin          string
+	work, bin, state string
 }
 
-// runMake copies the Makefile and retry.sh into a scratch directory and runs
-// `make target` there with a PATH that holds ONLY the fake go and the handful
-// of system commands the recipes use -- so neither the real toolchain nor a
-// golangci-lint installed on this machine can take part. files seeds the fake
-// toolchain's state (see fakeGo).
-func runMake(t *testing.T, target string, files map[string]string, pathTools map[string]string) makeRun {
+// newMakeEnv builds the scratch directory. pathTools are extra executables to
+// put on PATH (name to script).
+func newMakeEnv(t *testing.T, pathTools map[string]string) *makeEnv {
 	t.Helper()
 	needShell(t)
 	makeBin, err := exec.LookPath("make")
@@ -318,21 +534,23 @@ func runMake(t *testing.T, target string, files map[string]string, pathTools map
 		t.Skip("no make on PATH")
 	}
 
-	work := t.TempDir()
+	work := filepath.Join(t.TempDir(), "check out")
+	e := &makeEnv{
+		t: t, makeBin: makeBin, work: work,
+		bin: filepath.Join(work, "fake bin"), state: filepath.Join(work, "state"),
+	}
 	for _, name := range []string{"Makefile", filepath.Join("scripts", "retry.sh")} {
-		raw, err := os.ReadFile(filepath.Join("..", name)) //nolint:gosec // G304: this repository's own files
+		raw, err := os.ReadFile(filepath.Join("..", name))
 		if err != nil {
 			t.Fatal(err)
 		}
 		writeFile(t, filepath.Join(work, name), string(raw), 0o600)
 	}
-
-	bin := filepath.Join(work, "fakebin")
-	writeFile(t, filepath.Join(bin, "go"), fakeGo, 0o700)
+	writeFile(t, filepath.Join(e.bin, "go"), fakeGo, 0o700)
 	for name, body := range pathTools {
-		writeFile(t, filepath.Join(bin, name), body, 0o700)
+		writeFile(t, filepath.Join(e.bin, name), body, 0o700)
 	}
-	for _, name := range []string{"sh", "cat", "mkdir", "chmod", "date", "sleep", "true", "timeout"} {
+	for _, name := range []string{"sh", "cat", "mkdir", "chmod", "date", "sleep", "true", "awk", "grep", "mktemp", "rm", "timeout"} {
 		found, err := exec.LookPath(name)
 		if err != nil {
 			if name == "timeout" {
@@ -340,37 +558,71 @@ func runMake(t *testing.T, target string, files map[string]string, pathTools map
 			}
 			t.Skipf("no %s on PATH", name)
 		}
-		if err := os.Symlink(found, filepath.Join(bin, name)); err != nil {
+		if err := os.Symlink(found, filepath.Join(e.bin, name)); err != nil {
 			t.Fatal(err)
 		}
 	}
+	writeFile(t, filepath.Join(e.state, ".keep"), "", 0o600)
+	return e
+}
 
-	state := filepath.Join(work, "state")
-	writeFile(t, filepath.Join(state, ".keep"), "", 0o600)
-	for name, content := range files {
-		writeFile(t, filepath.Join(state, name), content, 0o600)
-	}
+// set seeds the fake toolchain's state (see fakeGo).
+func (e *makeEnv) set(name, content string) {
+	e.t.Helper()
+	writeFile(e.t, filepath.Join(e.state, name), content, 0o600)
+}
 
-	cmd := exec.CommandContext(t.Context(), makeBin, target) //nolint:gosec // G204: make from PATH, a fixed target name
-	cmd.Dir = work
-	// A clean environment, not os.Environ(): under `make test` this process
-	// inherits MAKEFLAGS and any command-line variable overrides, and they
-	// must not leak into the make under test.
-	cmd.Env = []string{
-		"PATH=" + bin,
-		"HOME=" + work,
-		"FAKE_DIR=" + state,
+// makeRun is the outcome of one `make target`. The logs are cumulative over
+// every run in the same makeEnv.
+type makeRun struct {
+	code    int
+	out     string
+	goLog   []string // every `go ...` call, in order
+	toolLog []string // every call of an installed (or PATH) tool, in order
+}
+
+// run runs `make target` with env added to a CLEAN environment -- not
+// os.Environ(): under `make test` this process inherits MAKEFLAGS and any
+// command-line variable overrides, and they must not leak into the make under
+// test.
+func (e *makeEnv) run(target string, env ...string) makeRun {
+	e.t.Helper()
+	cmd := exec.CommandContext(e.t.Context(), e.makeBin, target)
+	cmd.Dir = e.work
+	cmd.Env = append([]string{
+		"PATH=" + e.bin,
+		"HOME=" + e.work,
+		"TMPDIR=" + e.state,
+		"FAKE_DIR=" + e.state,
+		"FAKE_DEFAULT_MSG=" + fetchFailure,
 		"RETRY_DELAY=0",
 		"RETRY_ATTEMPTS=4",
-	}
+	}, env...)
 	raw, err := cmd.CombinedOutput()
 	return makeRun{
-		code:    exitCode(t, err),
+		code:    exitCode(e.t, err),
 		out:     string(raw),
-		goLog:   lines(t, filepath.Join(state, "go.log")),
-		toolLog: lines(t, filepath.Join(state, "tool.log")),
+		goLog:   lines(e.t, filepath.Join(e.state, "go.log")),
+		toolLog: lines(e.t, filepath.Join(e.state, "tool.log")),
 	}
 }
+
+// runMake is one run in a fresh makeEnv seeded with files.
+func runMake(t *testing.T, target string, files, pathTools map[string]string) makeRun {
+	t.Helper()
+	e := newMakeEnv(t, pathTools)
+	for name, content := range files {
+		e.set(name, content)
+	}
+	return e.run(target)
+}
+
+const (
+	goList           = "go list -deps -test ./..."
+	goInstallVuln    = "go install golang.org/x/vuln/cmd/govulncheck@"
+	goInstallLint    = "go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@"
+	nonDownloadError = "go: cannot install cross-compiled binaries when GOBIN is set"
+)
 
 // The point of the whole change. Each case is a gate whose TOOL reports a
 // problem; whatever the downloads did first, the verdict command runs exactly
@@ -430,36 +682,103 @@ func TestMakeNeverRetriesAVerdict(t *testing.T) {
 	}
 }
 
+// Every download a gate depends on is retried: the module fetch, and the
+// install of each tool.
 func TestMakeRetriesTheDownloads(t *testing.T) {
 	t.Parallel()
-	r := runMake(t, "vulncheck", map[string]string{"list.fails": "1", "install.fails": "2"}, nil)
-	if r.code != 0 {
-		t.Fatalf("make vulncheck failed (%d) though every download recovered\n%s", r.code, r.out)
-	}
-	if n := count(r.goLog, "go list -deps -test ./..."); n != 2 {
-		t.Errorf("module download ran %d times, want 2 (one failure, one success)\n%s", n, r.out)
-	}
-	if n := count(r.goLog, "go install golang.org/x/vuln/cmd/govulncheck@"); n != 3 {
-		t.Errorf("tool install ran %d times, want 3 (two failures, one success)\n%s", n, r.out)
-	}
-	if n := count(r.toolLog, "govulncheck ./..."); n != 1 {
-		t.Errorf("govulncheck ran %d times, want exactly 1\n%s", n, r.out)
+	for name, tc := range map[string]struct {
+		target, install, verdict string
+	}{
+		"vulncheck": {"vulncheck", goInstallVuln, "govulncheck ./..."},
+		"lint":      {"lint", goInstallLint, "golangci-lint run"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			r := runMake(t, tc.target, map[string]string{"list.fails": "1", "install.fails": "2"}, nil)
+			if r.code != 0 {
+				t.Fatalf("make %s failed (%d) though every download recovered\n%s", tc.target, r.code, r.out)
+			}
+			if n := count(r.goLog, goList); n != 2 {
+				t.Errorf("module download ran %d times, want 2 (one failure, one success)\n%s", n, r.out)
+			}
+			if n := count(r.goLog, tc.install); n != 3 {
+				t.Errorf("tool install ran %d times, want 3 (two failures, one success)\n%s", n, r.out)
+			}
+			if n := count(r.toolLog, tc.verdict); n != 1 {
+				t.Errorf("%q ran %d times, want exactly 1\n%s", tc.verdict, n, r.out)
+			}
+		})
 	}
 }
 
-// A download that never recovers fails the gate after the bounded attempts,
-// and the tool is never run on a half-prepared tree.
+// Every Go gate fetches the module graph first, through the retry: when that
+// fetch never recovers the gate fails after the bounded attempts and its
+// verdict command is never run on a half-prepared tree.
+func TestMakeGatesFetchModulesFirst(t *testing.T) {
+	t.Parallel()
+	for target, verdict := range map[string]string{
+		"test":      "go test ",
+		"lint":      "go vet ",
+		"vulncheck": "go install ", // not even the tool install is reached
+	} {
+		t.Run(target, func(t *testing.T) {
+			t.Parallel()
+			r := runMake(t, target, map[string]string{"list.fails": "99"}, nil)
+			if r.code == 0 {
+				t.Fatalf("make %s passed without its modules\n%s", target, r.out)
+			}
+			if n := count(r.goLog, goList); n != 4 {
+				t.Errorf("module download ran %d times, want exactly RETRY_ATTEMPTS=4\n%s", n, r.out)
+			}
+			if n := count(r.goLog, verdict); n != 0 || len(r.toolLog) != 0 {
+				t.Errorf("%q ran %d times and tools ran %v, want nothing after a failed module download\n%s", verdict, n, r.toolLog, r.out)
+			}
+		})
+	}
+}
+
+// A tool download that never recovers fails the gate after the bounded
+// attempts, and the tool is never run.
 func TestMakeFailsWhenTheDownloadNeverRecovers(t *testing.T) {
 	t.Parallel()
-	r := runMake(t, "vulncheck", map[string]string{"install.fails": "99"}, nil)
-	if r.code == 0 {
-		t.Fatalf("make vulncheck passed without its tool\n%s", r.out)
+	for target, install := range map[string]string{"vulncheck": goInstallVuln, "lint": goInstallLint} {
+		t.Run(target, func(t *testing.T) {
+			t.Parallel()
+			r := runMake(t, target, map[string]string{"install.fails": "99"}, nil)
+			if r.code == 0 {
+				t.Fatalf("make %s passed without its tool\n%s", target, r.out)
+			}
+			if n := count(r.goLog, install); n != 4 {
+				t.Errorf("tool install ran %d times, want exactly RETRY_ATTEMPTS=4\n%s", n, r.out)
+			}
+			if len(r.toolLog) != 0 {
+				t.Errorf("the tool ran although its install failed: %v", r.toolLog)
+			}
+		})
 	}
-	if n := count(r.goLog, "go install "); n != 4 {
-		t.Errorf("tool install ran %d times, want exactly RETRY_ATTEMPTS=4\n%s", n, r.out)
-	}
-	if len(r.toolLog) != 0 {
-		t.Errorf("the tool ran although its install failed: %v", r.toolLog)
+}
+
+// A failure of a download step that is not a download problem is reported at
+// once, not after four attempts.
+func TestMakeDoesNotRetryANonDownloadFailure(t *testing.T) {
+	t.Parallel()
+	for target, tc := range map[string]struct{ verb, call string }{
+		"vulncheck": {"install", goInstallVuln},
+		"test":      {"list", goList},
+	} {
+		t.Run(target, func(t *testing.T) {
+			t.Parallel()
+			r := runMake(t, target, map[string]string{tc.verb + ".fails": "99", tc.verb + ".msg": nonDownloadError}, nil)
+			if r.code == 0 {
+				t.Fatalf("make %s passed\n%s", target, r.out)
+			}
+			if n := count(r.goLog, tc.call); n != 1 {
+				t.Errorf("%q ran %d times, want exactly 1\n%s", tc.call, n, r.out)
+			}
+			if !strings.Contains(r.out, nonDownloadError) {
+				t.Errorf("go's own message was lost:\n%s", r.out)
+			}
+		})
 	}
 }
 
@@ -475,5 +794,106 @@ func TestMakeLintPrefersPathBinary(t *testing.T) {
 	}
 	if n := count(r.toolLog, "golangci-lint run"); n != 1 {
 		t.Errorf("golangci-lint ran %d times, want 1\n%s", n, r.out)
+	}
+}
+
+// The pinned tool already in bin/tools, built with this toolchain, is used
+// without asking the proxy for anything: the gates work offline. A changed
+// pin or a changed toolchain still reinstalls.
+func TestMakeReinstallsAToolOnlyWhenItIsStale(t *testing.T) {
+	t.Parallel()
+	for target, tc := range map[string]struct{ install, verdict, pin string }{
+		"vulncheck": {goInstallVuln, "govulncheck ./...", "GOVULNCHECK_VERSION"},
+		"lint":      {goInstallLint, "golangci-lint run", "GOLANGCI_LINT_VERSION"},
+	} {
+		t.Run(target, func(t *testing.T) {
+			t.Parallel()
+			e := newMakeEnv(t, nil)
+			if r := e.run(target); r.code != 0 || count(r.goLog, tc.install) != 1 {
+				t.Fatalf("first run: exit %d, %d installs, want 0 and 1\n%s", r.code, count(r.goLog, tc.install), r.out)
+			}
+
+			// The proxy goes away. Nothing needs it.
+			e.set("install.fails", "99")
+			r := e.run(target)
+			if r.code != 0 {
+				t.Fatalf("offline run with the tool present failed (%d)\n%s", r.code, r.out)
+			}
+			if n := count(r.goLog, tc.install); n != 1 {
+				t.Errorf("go install ran %d times in all, want 1: the present tool must not be reinstalled\n%s", n, r.out)
+			}
+			if n := count(r.toolLog, tc.verdict); n != 2 {
+				t.Errorf("%q ran %d times over two runs, want 2\n%s", tc.verdict, n, r.out)
+			}
+
+			// A different pin: the binary is stale, the install is attempted
+			// (and, with the proxy still away, fails the gate).
+			r = e.run(target, tc.pin+"=v9.9.9")
+			if r.code == 0 || count(r.goLog, tc.install+"v9.9.9") != 4 {
+				t.Errorf("changed pin: exit %d, %d installs of v9.9.9, want a failure after 4\n%s",
+					r.code, count(r.goLog, tc.install+"v9.9.9"), r.out)
+			}
+			if n := count(r.toolLog, tc.verdict); n != 2 {
+				t.Errorf("the stale tool was run (%d runs in all, want still 2)\n%s", n, r.out)
+			}
+
+			// The proxy is back and the toolchain has changed: reinstall.
+			e.set("install.fails", "0")
+			e.set("goversion", "go1.99.0")
+			before := count(r.goLog, tc.install)
+			r = e.run(target)
+			if r.code != 0 || count(r.goLog, tc.install) != before+1 {
+				t.Errorf("changed toolchain: exit %d, %d new installs, want 0 and 1\n%s",
+					r.code, count(r.goLog, tc.install)-before, r.out)
+			}
+		})
+	}
+}
+
+// Every gate works from a checkout whose path has a space in it. (Every other
+// make test here runs in such a directory too; this one says so.)
+func TestMakeWorksFromAPathWithASpace(t *testing.T) {
+	t.Parallel()
+	for target, verdict := range map[string]string{"vulncheck": "govulncheck ./...", "lint": "golangci-lint run"} {
+		t.Run(target, func(t *testing.T) {
+			t.Parallel()
+			e := newMakeEnv(t, nil)
+			if !strings.Contains(e.work, " ") {
+				t.Fatalf("the scratch checkout %q has no space in its path", e.work)
+			}
+			r := e.run(target)
+			if r.code != 0 || count(r.toolLog, verdict) != 1 {
+				t.Errorf("exit %d, %q ran %d times; want 0 and 1\n%s", r.code, verdict, count(r.toolLog, verdict), r.out)
+			}
+		})
+	}
+}
+
+// The rule the tests above enforce for today's gates, as a rule about the
+// Makefile's text, so that a NEW recipe cannot put a verdict behind the retry
+// either: the only things $(RETRY) may run are `go list` and `go install`.
+func TestMakefileRetriesOnlyDownloads(t *testing.T) {
+	t.Parallel()
+	raw, err := os.ReadFile(filepath.Join("..", "Makefile"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	allowed := regexp.MustCompile(`\$\(RETRY\) go (list|install) `)
+	uses := 0
+	for i, line := range strings.Split(string(raw), "\n") {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "#") || strings.HasPrefix(trimmed, "RETRY ") {
+			continue
+		}
+		if !strings.Contains(line, "$(RETRY)") && !strings.Contains(line, "retry.sh") {
+			continue
+		}
+		uses++
+		if strings.Count(line, "$(RETRY)") != 1 || !allowed.MatchString(line) {
+			t.Errorf("Makefile:%d puts something other than a download behind the retry:\n%s", i+1, line)
+		}
+	}
+	if uses != 2 {
+		t.Errorf("found %d uses of $(RETRY) in the Makefile, want 2 (the module fetch and the tool install); update this test with the Makefile", uses)
 	}
 }
