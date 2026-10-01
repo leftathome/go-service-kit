@@ -14,16 +14,24 @@
 // This file writes executable fixtures and runs them, which is everything
 // gosec exists to flag; .golangci.yml excludes gosec for this one file rather
 // than have it carry a nolint directive per call.
+//
+// Unix only: everything here drives sh and make, and the signal tests need
+// kill(2).
+
+//go:build unix
+
 package scripts
 
 import (
+	"bytes"
 	"errors"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"regexp"
-	"runtime"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -36,7 +44,11 @@ const fetchFailure = `go: golang.org/x/vuln/cmd/govulncheck@v1.6.0: Get "https:/
 // than $1 times, counting its runs in ./runs. A failing run prints $FLAKY_MSG
 // (default: a fetch failure) to stderr -- unless a third argument says how to
 // overstay instead: "hang" sleeps, "stubborn" sleeps ignoring SIGTERM, "polite"
-// sleeps and exits 0 when it gets SIGTERM.
+// sleeps and exits 0 when it gets SIGTERM, "chatty" writes a line to stderr and
+// its pid to ./pid and then sleeps. "edge" is the one mode that does not
+// overstay: it fails by itself just as the wall clock enters the second in
+// which a 2s limit would expire (or, started too early in a second for that to
+// be safely before the limit, records ./inconclusive and exits 0).
 const flaky = `#!/bin/sh
 echo run >>runs
 n=$(wc -l <runs)
@@ -55,6 +67,24 @@ polite)
 		i=$((i + 1))
 	done
 	;;
+chatty)
+	echo "flaky: partial progress" >&2
+	echo $$ >pid
+	exec sleep 60
+	;;
+edge)
+	s=$(date +%s)
+	case "$(date +%N)" in
+	[3-9][0-9]*) ;;
+	*)
+		echo early >inconclusive
+		exit 0
+		;;
+	esac
+	while [ "$(date +%s)" -lt $((s + 2)) ]; do
+		sleep 0.05
+	done
+	;;
 esac
 echo "${FLAKY_MSG:-$FLAKY_DEFAULT_MSG}" >&2
 exit "$2"
@@ -69,7 +99,8 @@ echo "$1" >>"$SLEEP_LOG"
 // fakeGo stands in for the go command under make. Every call is appended to
 // $FAKE_DIR/go.log.
 //
-//   - `go env GOVERSION` prints $FAKE_DIR/goversion (default go1.26.6).
+//   - `go env GOVERSION|GOHOSTOS|GOHOSTARCH` prints $FAKE_DIR/goversion, goos
+//     or goarch (defaults go1.26.6, linux, amd64).
 //   - `go version -m <binary>` prints what a successful install recorded next
 //     to that binary, in the real command's format.
 //   - any other `go <verb>` fails while $FAKE_DIR/<verb>.fails holds a number
@@ -77,7 +108,10 @@ echo "$1" >>"$SLEEP_LOG"
 //     fetch failure); then it exits with $FAKE_DIR/<verb>.exit (default 0).
 //   - a successful `go install pkg@version` writes a fake tool into $GOBIN that
 //     logs its own calls to $FAKE_DIR/tool.log and exits with
-//     $FAKE_DIR/tool.exit.
+//     $FAKE_DIR/tool.exit. Like the real command it leaves a file that is
+//     already there ALONE (go decides "up to date" from its build cache, not
+//     from the file), so a damaged tool is only repaired if the Makefile
+//     removed it first.
 //
 // A failing VERDICT (the tool, or go vet / go test via <verb>.exit) also prints
 // a fetch-failure line. That is the worst case for the rule under test: a real
@@ -87,9 +121,16 @@ const fakeGo = `#!/bin/sh
 echo "go $*" >>"$FAKE_DIR/go.log"
 verb=$1
 gover=$(cat "$FAKE_DIR/goversion" 2>/dev/null || echo go1.26.6)
+goos=$(cat "$FAKE_DIR/goos" 2>/dev/null || echo linux)
+goarch=$(cat "$FAKE_DIR/goarch" 2>/dev/null || echo amd64)
 case "$verb" in
 env)
-	echo "$gover"
+	case "$2" in
+	GOVERSION) echo "$gover" ;;
+	GOHOSTOS) echo "$goos" ;;
+	GOHOSTARCH) echo "$goarch" ;;
+	*) exit 1 ;;
+	esac
 	exit 0
 	;;
 version)
@@ -107,16 +148,18 @@ if [ "$verb" = install ]; then
 	pkg=${2%@*}
 	name=${pkg##*/}
 	mkdir -p "$GOBIN"
-	cat >"$GOBIN/$name" <<TOOL
+	if [ ! -e "$GOBIN/$name" ]; then
+		cat >"$GOBIN/$name" <<TOOL
 #!/bin/sh
 echo "$name \$*" >>"$FAKE_DIR/tool.log"
 rc=\$(cat "$FAKE_DIR/tool.exit" 2>/dev/null || echo 0)
 [ "\$rc" = 0 ] || echo "\$FAKE_DEFAULT_MSG" >&2
 exit "\$rc"
 TOOL
-	chmod +x "$GOBIN/$name"
-	printf '%s: %s\n\tpath\t%s\n\tmod\t%s\t%s\th1:fake=\n' \
-		"$GOBIN/$name" "$gover" "$pkg" "$pkg" "${2##*@}" >"$GOBIN/$name.meta"
+		chmod +x "$GOBIN/$name"
+	fi
+	printf '%s: %s\n\tpath\t%s\n\tmod\t%s\t%s\th1:fake=\n\tbuild\t-buildmode=exe\n\tbuild\tGOARCH=%s\n\tbuild\tGOOS=%s\n' \
+		"$GOBIN/$name" "$gover" "$pkg" "$pkg" "${2##*@}" "$goarch" "$goos" >"$GOBIN/$name.meta"
 fi
 rc=$(cat "$FAKE_DIR/$verb.exit" 2>/dev/null || echo 0)
 [ "$rc" = 0 ] || echo "$FAKE_DEFAULT_MSG" >&2
@@ -150,9 +193,6 @@ wait "$pid"
 
 func needShell(t *testing.T) {
 	t.Helper()
-	if runtime.GOOS == "windows" {
-		t.Skip("retry.sh is a POSIX shell script")
-	}
 	if _, err := exec.LookPath("sh"); err != nil {
 		t.Skip("no sh on PATH")
 	}
@@ -304,46 +344,278 @@ func TestRetryDefaultBackoff(t *testing.T) {
 
 // Only a failure that looks like a failed fetch is worth waiting on. Each
 // message is what the always-failing command prints; it is retried or it
-// fails at once.
+// fails at once. The retried ones are one sample per alternative of the
+// default pattern, each chosen to match that alternative and no other, so that
+// losing any one of them fails here.
 func TestRetryOnlyRetriesWhatLooksLikeAFailedDownload(t *testing.T) {
 	t.Parallel()
-	for name, tc := range map[string]struct {
-		msg     string
-		pattern string
-		retried bool
-	}{
-		"TLS handshake timeout on the path query": {msg: fetchFailure, retried: true},
-		"dial timeout":                {msg: `Get "http://127.0.0.1:9/x/@v/v1.info": dial tcp 127.0.0.1:9: i/o timeout`, retried: true},
-		"proxy 502":                   {msg: `go: example.com/m@v1.0.0: reading https://proxy.golang.org/example.com/m/@v/v1.0.0.zip: 502 Bad Gateway`, retried: true},
-		"connection reset":            {msg: `read tcp 10.0.0.1:1234->142.250.0.1:443: read: connection reset by peer`, retried: true},
-		"DNS failure":                 {msg: `dial tcp: lookup proxy.golang.org: no such host`, retried: true},
-		"truncated body":              {msg: `go: downloading example.com/m v1.0.0: unexpected EOF`, retried: true},
-		"git cannot resolve the host": {msg: `fatal: unable to access 'https://example.com/m/': Could not resolve host: example.com`, retried: true},
+	retried := map[string]string{
+		"the recorded incident":     fetchFailure,
+		"Get, nothing else":         `go: example.com/m@v1.0.0: Get "https://proxy.golang.org/example.com/m/@v/v1.0.0.mod": net/http: request canceled`,
+		"read, body phase":          `go: example.com/m@v1.0.0: read "https://proxy.golang.org/example.com/m/@v/v1.0.0.zip": stream reset`,
+		"proxy 502":                 `go: example.com/m@v1.0.0: reading https://proxy.golang.org/example.com/m/@v/v1.0.0.zip: 502`,
+		"proxy 429":                 `go: example.com/m@v1.0.0: reading https://proxy.golang.org/example.com/m/@v/v1.0.0.zip: 429`,
+		"proxy 408":                 `go: example.com/m@v1.0.0: reading https://proxy.golang.org/example.com/m/@v/v1.0.0.zip: 408`,
+		"git 503":                   `error: The requested URL returned error: 503`,
+		"git 408":                   `error: The requested URL returned error: 408`,
+		"dial":                      `dial tcp 142.250.0.1:443: connect: operation not permitted`,
+		"i/o timeout":               `read udp 10.0.0.1:5353: i/o timeout`,
+		"TLS handshake timeout":     `net/http: TLS handshake timeout`,
+		"TLS handshake failure":     `remote error: tls: handshake failure`,
+		"connection reset":          `read: connection reset by peer`,
+		"connection refused":        `connect: connection refused`,
+		"connection timed out":      `connect: connection timed out`,
+		"connection closed":         `http: server closed idle connection closed`,
+		"broken pipe":               `write: broken pipe`,
+		"closed network connection": `use of closed network connection`,
+		"bad record MAC":            `local error: tls: bad record MAC`,
+		"truncated body":            `go: downloading example.com/m v1.0.0: unexpected EOF`,
+		"bare EOF":                  `go: example.com/m@v1.0.0: EOF`,
+		"DNS, no such host":         `lookup proxy.golang.org: no such host`,
+		"DNS, server misbehaving":   `lookup proxy.golang.org on 10.96.0.10:53: server misbehaving`,
+		"DNS, temporary failure":    `Temporary failure in name resolution`,
+		"network unreachable":       `connect: network is unreachable`,
+		"no route":                  `connect: no route to host`,
+		"deadline":                  `context deadline exceeded`,
+		"client timeout":            `(Client.Timeout exceeded while awaiting headers)`,
+		"HTTP/2 stream error":       `stream error: stream ID 7; INTERNAL_ERROR`,
+		"HTTP/2":                    `http2: server sent GOAWAY and closed`,
+		"status text, 408":          `408 Request Timeout`,
+		"status text, 502":          `Bad Gateway`,
+		"status text, 503":          `Service Unavailable`,
+		"status text, 504":          `Gateway Timeout`,
+		"status text, 429":          `Too Many Requests`,
+		"corrupt zip":               `go: example.com/m@v1.0.0: zip: not a valid zip file`,
+		"git cannot resolve":        `fatal: unable to access 'https://example.com/m/': Could not resolve host: example.com`,
+		"curl cannot connect":       `fatal: unable to access 'https://example.com/m/': Failed to connect to example.com port 443`,
+		"git early EOF":             `fatal: early EOF`,
+		"git hung up":               `fatal: the remote end hung up unexpectedly`,
+		"git gnutls":                `fatal: unable to access 'https://example.com/m/': gnutls_handshake() failed: Error in the pull function.`,
+		"git RPC":                   `error: RPC failed; HTTP 000`,
+		"curl 56":                   `error: curl 56 GnuTLS recv error (-54)`,
+		"curl 18":                   `error: curl 18 transfer closed with outstanding read data remaining`,
+		"RETRY_PATTERN widens it":   `missing go.sum entry for module providing package example.com/m`,
+	}
+	failsAtOnce := map[string]string{
+		"missing go.sum entry":         `missing go.sum entry for module providing package example.com/m; to add it: go get example.com/m`,
+		"cross-compiled install":       `go: cannot install cross-compiled binaries when GOBIN is set`,
+		"version that does not exist":  `go: example.com/m@v9.9.9: reading https://proxy.golang.org/example.com/m/@v/v9.9.9.info: 404 Not Found`,
+		"version that is gone":         `go: example.com/m@v9.9.9: reading https://proxy.golang.org/example.com/m/@v/v9.9.9.info: 410 Gone`,
+		"import that does not resolve": `package example.com/nope is not in std`,
+		"compile error in the tool":    `./main.go:3:1: syntax error: non-declaration statement outside function body`,
+		"says nothing at all":          ` `,
+	}
+	run := func(name, msg, pattern string, wantRuns int) {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			code, out, dir := runRetry(t, []string{
+				"RETRY_DELAY=0", "RETRY_ATTEMPTS=2", "FLAKY_MSG=" + msg, "RETRY_PATTERN=" + pattern,
+			}, "./flaky", "99", "5")
+			if code != 5 || runs(t, dir) != wantRuns {
+				t.Errorf("exit %d after %d runs, want 5 after %d\n%s", code, runs(t, dir), wantRuns, out)
+			}
+			if wantRuns == 1 && !strings.Contains(out, "retry: not retrying, this does not look like a failed download (exit 5)") {
+				t.Errorf("missing the not-retrying line in:\n%s", out)
+			}
+		})
+	}
+	for name, msg := range retried {
+		pattern := ""
+		if name == "RETRY_PATTERN widens it" {
+			pattern = `go\.sum`
+		}
+		run("retried/"+name, msg, pattern, 2)
+	}
+	for name, msg := range failsAtOnce {
+		run("fails at once/"+name, msg, "", 1)
+	}
+}
 
-		"missing go.sum entry":          {msg: `missing go.sum entry for module providing package example.com/m; to add it: go get example.com/m`},
-		"cross-compiled install":        {msg: `go: cannot install cross-compiled binaries when GOBIN is set`},
-		"version that does not exist":   {msg: `go: example.com/m@v9.9.9: reading https://proxy.golang.org/example.com/m/@v/v9.9.9.info: 404 Not Found`},
-		"import that does not resolve":  {msg: `package example.com/nope is not in std`},
-		"checksum mismatch":             {msg: `verifying example.com/m@v1.0.0: checksum mismatch`},
-		"compile error in the tool":     {msg: `./main.go:3:1: syntax error: non-declaration statement outside function body`},
-		"RETRY_PATTERN widens the list": {msg: `missing go.sum entry for module providing package example.com/m`, pattern: `go\.sum`, retried: true},
+// A checksum mismatch is a finding about the supply chain. It is never
+// retried: not when the same output also carries a network error, and not when
+// RETRY_PATTERN would match it.
+func TestRetryNeverRetriesAChecksumMismatch(t *testing.T) {
+	t.Parallel()
+	mismatch := "verifying example.com/m@v1.0.0: checksum mismatch\n\tdownloaded: h1:AAAA\n\tgo.sum:     h1:BBBB\n\nSECURITY ERROR\nThis download does NOT match an earlier download recorded in go.sum."
+	for name, tc := range map[string]struct{ msg, pattern string }{
+		"go.sum mismatch":                 {msg: mismatch},
+		"checksum database mismatch":      {msg: "verifying module: checksum mismatch\n\tdownloaded: h1:AAAA\n\tsum.golang.org: h1:BBBB"},
+		"the SECURITY ERROR banner alone": {msg: "SECURITY ERROR"},
+		"with a network error beside it":  {msg: fetchFailure + "\n" + mismatch},
+		"with RETRY_PATTERN matching it":  {msg: mismatch, pattern: "checksum|verifying"},
+		"with RETRY_PATTERN matching all": {msg: mismatch, pattern: "."},
 	} {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
 			code, out, dir := runRetry(t, []string{
-				"RETRY_DELAY=0", "RETRY_ATTEMPTS=2", "FLAKY_MSG=" + tc.msg, "RETRY_PATTERN=" + tc.pattern,
-			}, "./flaky", "99", "5")
-			want := 1
-			if tc.retried {
-				want = 2
+				"RETRY_DELAY=0", "RETRY_ATTEMPTS=3", "FLAKY_MSG=" + tc.msg, "RETRY_PATTERN=" + tc.pattern,
+			}, "./flaky", "99", "1")
+			if code != 1 || runs(t, dir) != 1 {
+				t.Errorf("exit %d after %d runs, want 1 after exactly 1\n%s", code, runs(t, dir), out)
 			}
-			if code != 5 || runs(t, dir) != want {
-				t.Errorf("exit %d after %d runs, want 5 after %d\n%s", code, runs(t, dir), want, out)
-			}
-			if !tc.retried && !strings.Contains(out, "retry: not retrying, this does not look like a failed download (exit 5)") {
-				t.Errorf("missing the not-retrying line in:\n%s", out)
+			if !strings.Contains(out, "retry: not retrying, a checksum mismatch is a finding, not a failed download (exit 1)") {
+				t.Errorf("missing the checksum line in:\n%s", out)
 			}
 		})
+	}
+}
+
+// stdout is the command's and passes through untouched; only stderr is
+// captured, and it comes back out on stderr.
+func TestRetryKeepsStdoutApartFromStderr(t *testing.T) {
+	t.Parallel()
+	needShell(t)
+	cmd := exec.CommandContext(t.Context(), "sh", retryScript(t), "sh", "-c", "echo to-stdout; echo to-stderr >&2")
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout, cmd.Stderr = &stdout, &stderr
+	if err := cmd.Run(); err != nil {
+		t.Fatal(err)
+	}
+	if stdout.String() != "to-stdout\n" || stderr.String() != "to-stderr\n" {
+		t.Errorf("stdout %q, stderr %q; want \"to-stdout\\n\" and \"to-stderr\\n\"", stdout.String(), stderr.String())
+	}
+}
+
+// With coreutils timeout a kill is reported, so an attempt that fails by
+// itself -- however late, even in the second its limit runs out -- is an
+// ordinary failure: it is not called killed, and so it is not retried on the
+// strength of having been slow.
+func TestRetryDoesNotCallASlowFailureAKill(t *testing.T) {
+	t.Parallel()
+	needShell(t)
+	if exec.CommandContext(t.Context(), "timeout", "--foreground", "-k", "1", "5", "true").Run() != nil {
+		t.Skip("needs coreutils timeout; with busybox this is the documented limit")
+	}
+	for try := 0; try < 8; try++ {
+		// Start mid-second, so the command has room to finish before the limit.
+		time.Sleep(time.Duration((1500-time.Now().Nanosecond()/1e6)%1000) * time.Millisecond)
+		code, out, dir := runRetry(t, []string{
+			"RETRY_DELAY=0", "RETRY_ATTEMPTS=2", "RETRY_ATTEMPT_TIMEOUT=2", "FLAKY_MSG=not a download problem",
+		}, "./flaky", "99", "5", "edge")
+		// Inconclusive only if the FIRST attempt said so (it then exited 0 and
+		// there was no second). A second attempt means the first was retried,
+		// which is the failure this test exists to catch, whatever the second
+		// one went on to record.
+		if _, err := os.Stat(filepath.Join(dir, "inconclusive")); err == nil && runs(t, dir) == 1 {
+			continue // started too early in its second; try again
+		}
+		if code != 5 || runs(t, dir) != 1 {
+			t.Errorf("exit %d after %d runs, want the command's own 5 after 1\n%s", code, runs(t, dir), out)
+		}
+		if strings.Contains(out, "killed") || !strings.Contains(out, "this does not look like a failed download (exit 5)") {
+			t.Errorf("a command that failed by itself was called killed:\n%s", out)
+		}
+		return
+	}
+	t.Skip("could not start the command late enough in a second, eight times running")
+}
+
+// An interrupt is acted on at once, during an attempt and during the wait
+// between two: the attempt is stopped, the stderr captured so far is shown
+// (once), the temp directory is removed, nothing further is attempted, and the
+// exit status is the conventional 128+signal.
+func TestRetryStopsAtOnceWhenInterrupted(t *testing.T) {
+	t.Parallel()
+	needShell(t)
+	for name, tc := range map[string]struct {
+		sig  syscall.Signal
+		code int
+	}{
+		"SIGTERM": {syscall.SIGTERM, 143},
+		"SIGINT":  {syscall.SIGINT, 130},
+		"SIGHUP":  {syscall.SIGHUP, 129},
+	} {
+		for _, phase := range []string{"during an attempt", "during the backoff"} {
+			t.Run(name+" "+phase, func(t *testing.T) {
+				t.Parallel()
+				if signal.Ignored(tc.sig) {
+					t.Skipf("%s is ignored in this process, so a shell started from it cannot trap it", name)
+				}
+				dir := t.TempDir()
+				tmp := filepath.Join(dir, "tmp")
+				writeFile(t, filepath.Join(tmp, ".keep"), "", 0o600)
+				writeFile(t, filepath.Join(dir, "flaky"), flaky, 0o700)
+				outPath := filepath.Join(dir, "out")
+				outFile, err := os.Create(outPath)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer func() { _ = outFile.Close() }()
+
+				mode := "chatty" // sleeps 60s with a line of stderr captured
+				if phase == "during the backoff" {
+					mode = "" // fails at once with a fetch failure; then a 60s wait
+				}
+				cmd := exec.CommandContext(t.Context(), "sh", retryScript(t), "./flaky", "99", "1", mode)
+				cmd.Dir = dir
+				cmd.Stdout, cmd.Stderr = outFile, outFile
+				cmd.Env = append(os.Environ(), "TMPDIR="+tmp, "RETRY_ATTEMPTS=3", "RETRY_DELAY=60",
+					"RETRY_ATTEMPT_TIMEOUT=", "RETRY_BUDGET=", "RETRY_PATTERN=", "FLAKY_MSG=", "FLAKY_DEFAULT_MSG="+fetchFailure)
+				if err := cmd.Start(); err != nil {
+					t.Fatal(err)
+				}
+				ready := func() bool {
+					if mode == "chatty" {
+						return len(lines(t, filepath.Join(dir, "pid"))) == 1
+					}
+					return strings.Contains(strings.Join(lines(t, outPath), "\n"), "retrying in 60s")
+				}
+				for deadline := time.Now().Add(20 * time.Second); !ready(); time.Sleep(20 * time.Millisecond) {
+					if time.Now().After(deadline) {
+						_ = cmd.Process.Kill()
+						t.Fatalf("retry.sh never got as far as %s:\n%s", phase, strings.Join(lines(t, outPath), "\n"))
+					}
+				}
+				time.Sleep(200 * time.Millisecond) // let it settle into the wait
+
+				sent := time.Now()
+				if err := cmd.Process.Signal(tc.sig); err != nil {
+					t.Fatal(err)
+				}
+				code := exitCode(t, cmd.Wait())
+				took := time.Since(sent)
+				out := strings.Join(lines(t, outPath), "\n")
+
+				if code != tc.code {
+					t.Errorf("exit %d, want %d\n%s", code, tc.code, out)
+				}
+				if took > 5*time.Second {
+					t.Errorf("took %s to stop; an interrupt must not wait for the attempt or the backoff", took)
+				}
+				if runs(t, dir) != 1 {
+					t.Errorf("%d attempts were started, want 1\n%s", runs(t, dir), out)
+				}
+				left, err := os.ReadDir(tmp)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if len(left) != 1 { // .keep
+					t.Errorf("the temp directory was left behind: %v", left)
+				}
+				if mode == "chatty" {
+					if strings.Count(out, "flaky: partial progress") != 1 {
+						t.Errorf("the captured stderr was not shown exactly once:\n%s", out)
+					}
+					pid := 0
+					for _, c := range lines(t, filepath.Join(dir, "pid"))[0] {
+						pid = pid*10 + int(c-'0')
+					}
+					gone := false
+					for deadline := time.Now().Add(5 * time.Second); time.Now().Before(deadline); time.Sleep(20 * time.Millisecond) {
+						if errors.Is(syscall.Kill(pid, 0), syscall.ESRCH) {
+							gone = true
+							break
+						}
+					}
+					if !gone {
+						_ = syscall.Kill(pid, syscall.SIGKILL)
+						t.Errorf("the attempt (pid %d) was left running", pid)
+					}
+				} else if strings.Count(out, fetchFailure) != 1 {
+					t.Errorf("the failed attempt's stderr was shown %d times, want once:\n%s", strings.Count(out, fetchFailure), out)
+				}
+			})
+		}
 	}
 }
 
@@ -837,16 +1109,72 @@ func TestMakeReinstallsAToolOnlyWhenItIsStale(t *testing.T) {
 				t.Errorf("the stale tool was run (%d runs in all, want still 2)\n%s", n, r.out)
 			}
 
-			// The proxy is back and the toolchain has changed: reinstall.
+			// The proxy is back. The stale tool was removed when its reinstall
+			// was attempted, so this run installs the pinned version again...
 			e.set("install.fails", "0")
-			e.set("goversion", "go1.99.0")
 			before := count(r.goLog, tc.install)
+			r = e.run(target)
+			if r.code != 0 || count(r.goLog, tc.install) != before+1 {
+				t.Fatalf("proxy back: exit %d, %d new installs, want 0 and 1\n%s",
+					r.code, count(r.goLog, tc.install)-before, r.out)
+			}
+			// ...and with that in place and current, a changed toolchain alone
+			// makes it stale.
+			e.set("goversion", "go1.99.0")
+			before = count(r.goLog, tc.install)
 			r = e.run(target)
 			if r.code != 0 || count(r.goLog, tc.install) != before+1 {
 				t.Errorf("changed toolchain: exit %d, %d new installs, want 0 and 1\n%s",
 					r.code, count(r.goLog, tc.install)-before, r.out)
 			}
 		})
+	}
+}
+
+// A tool that is in bin/tools at the right version but cannot be run here --
+// built for another platform, stripped of its exec bit, truncated -- is not
+// "already installed". It is removed and installed afresh, and the gate then
+// runs the new one.
+func TestMakeReinstallsAToolItCannotRun(t *testing.T) {
+	t.Parallel()
+	for name, damage := range map[string]func(t *testing.T, e *makeEnv, tool string){
+		"built for another architecture": func(_ *testing.T, e *makeEnv, _ string) { e.set("goarch", "arm64") },
+		"built for another OS":           func(_ *testing.T, e *makeEnv, _ string) { e.set("goos", "darwin") },
+		"no exec bit": func(t *testing.T, _ *makeEnv, tool string) {
+			if err := os.Chmod(tool, 0o600); err != nil {
+				t.Fatal(err)
+			}
+		},
+		"truncated": func(t *testing.T, _ *makeEnv, tool string) {
+			writeFile(t, tool, "\x7fELF", 0o700)
+			if err := os.Remove(tool + ".meta"); err != nil { // go version -m cannot read it either
+				t.Fatal(err)
+			}
+		},
+	} {
+		for target, tc := range map[string]struct{ install, verdict, tool string }{
+			"vulncheck": {goInstallVuln, "govulncheck ./...", "govulncheck"},
+			"lint":      {goInstallLint, "golangci-lint run", "golangci-lint"},
+		} {
+			t.Run(name+"/"+target, func(t *testing.T) {
+				t.Parallel()
+				e := newMakeEnv(t, nil)
+				if r := e.run(target); r.code != 0 || count(r.goLog, tc.install) != 1 {
+					t.Fatalf("first run: exit %d, %d installs, want 0 and 1\n%s", r.code, count(r.goLog, tc.install), r.out)
+				}
+				damage(t, e, filepath.Join(e.work, "bin", "tools", tc.tool))
+				r := e.run(target)
+				if r.code != 0 {
+					t.Fatalf("the gate did not recover from a tool it cannot run (exit %d)\n%s", r.code, r.out)
+				}
+				if n := count(r.goLog, tc.install); n != 2 {
+					t.Errorf("go install ran %d times in all, want 2: the unusable tool must be reinstalled\n%s", n, r.out)
+				}
+				if n := count(r.toolLog, tc.verdict); n != 2 {
+					t.Errorf("%q ran %d times over two runs, want 2: the reinstalled tool must be the one that runs\n%s", tc.verdict, n, r.out)
+				}
+			})
+		}
 	}
 }
 

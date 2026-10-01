@@ -85,19 +85,26 @@ mod-download: ## Fetch the modules the build and tests need, retrying a failed d
 	$(RETRY) go list -deps -test ./... >/dev/null
 
 # $(call install-tool,<binary>,<package>,<version>) puts the pinned tool in
-# $(TOOLS_BIN) -- unless the binary already there is that package at that
-# version, built by the toolchain in use (`go version -m` reads all three out
-# of the binary). `go install pkg@version` asks the proxy which module provides
-# the package on EVERY run, warm cache or not, so without the check the gates
-# could not run offline and paid for a round trip they did not need. A changed
-# pin or a changed toolchain does not match, and reinstalls.
+# $(TOOLS_BIN) -- unless the binary already there is executable and is that
+# package at that version, built by the toolchain in use for this machine's
+# OS and architecture (`go version -m` reads all of it out of the binary).
+# `go install pkg@version` asks the proxy which module provides the package on
+# EVERY run, warm cache or not, so without the check the gates could not run
+# offline and paid for a round trip they did not need.
+#
+# Anything else is stale and is REMOVED before the install: a changed pin or
+# toolchain, a binary for another platform (a bin/ shared between machines), a
+# lost exec bit, a truncated file. Removed, not just overwritten, because
+# `go install` has its own idea of up to date and leaves a damaged file of the
+# right build alone.
 define install-tool
-@have=$$(go version -m '$(TOOLS_BIN)/$(1)' 2>/dev/null | awk -v pkg='$(2)' \
-	'NR == 1 { gover = $$NF } $$1 == "path" && $$2 == pkg { found = 1 } $$1 == "mod" { ver = $$3 } END { if (found) print gover, ver }'); \
-if [ "$$have" = "$$(go env GOVERSION) $(3)" ]; then \
+@want="$$(go env GOVERSION) $(3) $$(go env GOHOSTOS)/$$(go env GOHOSTARCH)"; \
+have=$$(go version -m '$(TOOLS_BIN)/$(1)' 2>/dev/null | awk -v pkg='$(2)' 'NR == 1 { gover = $$NF } $$1 == "path" && $$2 == pkg { found = 1 } $$1 == "mod" { ver = $$3 } $$1 == "build" && $$2 ~ /^GOOS=/ { os = substr($$2, 6) } $$1 == "build" && $$2 ~ /^GOARCH=/ { arch = substr($$2, 8) } END { if (found) print gover, ver, os "/" arch }'); \
+if [ -x '$(TOOLS_BIN)/$(1)' ] && [ "$$have" = "$$want" ]; then \
 	echo '$(1) $(3) is already in $(TOOLS_BIN)'; \
 else \
 	echo 'installing $(1) $(3) into $(TOOLS_BIN)'; \
+	rm -f '$(TOOLS_BIN)/$(1)'; \
 	GOBIN="$$(pwd)/$(TOOLS_BIN)" $(RETRY) go install $(2)@$(3); \
 fi
 endef
