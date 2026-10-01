@@ -6,6 +6,21 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Security
+
+- **OpenTelemetry bumped past GO-2026-6505** (CVE-2026-81870,
+  GHSA-8wmf-6v46-5gfg: exporter config logging may leak endpoint URLs in
+  info logs; reachable through obs's OTLP trace exporter and the trace SDK).
+  The whole release train moves together: `otel`, `otel/metric`,
+  `otel/trace`, `otel/sdk`, `otel/sdk/metric`, `otlptrace` and
+  `otlptracegrpc` v1.44.0 -> v1.45.0, `exporters/prometheus` v0.66.0 ->
+  v0.67.0, contrib `otelhttp` and `runtime` v0.69.0 -> v0.70.0. Pulled up by
+  those modules' own requirements: `proto/otlp` v1.10.0 -> v1.11.0,
+  `go-logr/logr` v1.4.3 -> v1.4.4, genproto `api`/`rpc` to 20260803. No API
+  change. `make vulncheck` is green again. A consumer on v0.3.0 does not need
+  to wait for a kit release: requiring the v1.45.0 set in its own go.mod is
+  enough.
+
 ## [0.3.0] - 2026-09-26
 
 The kit's MCP tool server, and a pipeline on the primary forge.
