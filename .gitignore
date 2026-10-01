@@ -1,3 +1,6 @@
+# The pinned lint and vulncheck tools: `make lint` and `make vulncheck` install
+# them into bin/tools.
+/bin/
 
 # Beads / Dolt files (added by bd init)
 .dolt/
