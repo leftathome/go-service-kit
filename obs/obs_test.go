@@ -15,6 +15,7 @@ import (
 	coltracepb "go.opentelemetry.io/proto/otlp/collector/trace/v1"
 	"google.golang.org/grpc"
 
+	"go.opentelemetry.io/otel/sdk/resource"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	"go.opentelemetry.io/otel/sdk/trace/tracetest"
 )
@@ -363,5 +364,79 @@ func TestSetupRejectsBadLogLevel(t *testing.T) {
 	cfg.LogLevel = "loud"
 	if _, err := Setup(context.Background(), cfg); err == nil {
 		t.Fatal("Setup accepted an invalid log level; want error")
+	}
+}
+
+// TestSemconvPinMatchesSDKDefaultSchemaURL fails the moment an OpenTelemetry
+// bump moves the SDK's default resource to a semconv schema other than the one
+// the kit pins. resource.Merge refuses two different non-empty schema URLs, so
+// a divergence does not break the build or any behavioural test: buildResource
+// falls back to the explicit attributes, every service logs a WARN at start,
+// and target_info (and every span's resource) loses telemetry_sdk_*. That
+// happened with otel/sdk v1.45.0 (default schema 1.43.0) against a kit pinned
+// to semconv v1.41.0. The fix is always the same: move the SEMCONV PIN import
+// in obs.go to the version named in the failure.
+func TestSemconvPinMatchesSDKDefaultSchemaURL(t *testing.T) {
+	sdk := resource.Default().SchemaURL()
+	if sdk != semconvSchemaURL {
+		t.Fatalf("the SDK's default resource uses schema %q but the kit pins %q: "+
+			"resource.Merge will fail and target_info will lose telemetry_sdk_*; "+
+			"bump the SEMCONV PIN import in obs.go to match the SDK",
+			sdk, semconvSchemaURL)
+	}
+}
+
+// TestSetupMergesSDKDefaultResource is the behavioural half of the pin test
+// above: Setup must merge the SDK defaults into the service's resource without
+// complaint, and the labels the package doc promises on target_info must be
+// there.
+func TestSetupMergesSDKDefaultResource(t *testing.T) {
+	clearOTLPEnv(t)
+
+	buf := newSyncBuffer()
+	cfg := testConfig()
+	cfg.LogLevel = "debug"
+	cfg.LogOutput = buf
+
+	p, err := Setup(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("Setup: %v", err)
+	}
+	t.Cleanup(func() { _ = p.Shutdown(context.Background()) })
+
+	if logs := buf.String(); strings.Contains(logs, "resource merge failed") {
+		t.Errorf("Setup logged a resource merge failure:\n%s", logs)
+	}
+
+	_, byName := gatherNames(t, p)
+	mf, ok := byName["target_info"]
+	if !ok {
+		t.Fatal("target_info missing from /metrics")
+	}
+	if len(mf.GetMetric()) != 1 {
+		t.Fatalf("target_info has %d series, want 1", len(mf.GetMetric()))
+	}
+	labels := map[string]string{}
+	for _, lp := range mf.GetMetric()[0].GetLabel() {
+		labels[lp.GetName()] = lp.GetValue()
+	}
+	for _, want := range []string{
+		"telemetry_sdk_language",
+		"telemetry_sdk_name",
+		"telemetry_sdk_version",
+	} {
+		if labels[want] == "" {
+			t.Errorf("target_info has no %s label (SDK defaults were not merged); labels: %v", want, labels)
+		}
+	}
+	// The explicit identity still wins over the SDK defaults.
+	for name, want := range map[string]string{
+		"service_name":                "kit-test",
+		"service_version":             "0.0.1-test",
+		"deployment_environment_name": "test",
+	} {
+		if labels[name] != want {
+			t.Errorf("target_info %s = %q, want %q; labels: %v", name, labels[name], want, labels)
+		}
 	}
 }

@@ -16,10 +16,35 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `otlptracegrpc` v1.44.0 -> v1.45.0, `exporters/prometheus` v0.66.0 ->
   v0.67.0, contrib `otelhttp` and `runtime` v0.69.0 -> v0.70.0. Pulled up by
   those modules' own requirements: `proto/otlp` v1.10.0 -> v1.11.0,
-  `go-logr/logr` v1.4.3 -> v1.4.4, genproto `api`/`rpc` to 20260803. No API
-  change. `make vulncheck` is green again. A consumer on v0.3.0 does not need
-  to wait for a kit release: requiring the v1.45.0 set in its own go.mod is
-  enough.
+  `go-logr/logr` v1.4.3 -> v1.4.4, genproto `api`/`rpc` to 20260803.
+  `make vulncheck` is green again. The kit's exported API is unchanged.
+
+  **The bump needed a code change: the semconv pin moves v1.41.0 -> v1.43.0**
+  (`obs/obs.go`, the kit's one semconv import). otel/sdk v1.45.0 builds
+  `resource.Default()` on semconv 1.43.0 (v1.44.0: 1.41.0), and
+  `resource.Merge` refuses two different schema URLs. With the old pin every
+  `obs.Setup` logged `obs: resource merge failed, using explicit attributes
+  only` and fell back to the explicit identity, so `target_info` (and every
+  span's resource) lost `telemetry_sdk_language`, `telemetry_sdk_name` and
+  `telemetry_sdk_version` -- labels the package doc promises. The four
+  attribute keys the kit uses (`service.name`, `service.version`,
+  `service.instance.id`, `deployment.environment.name`) are identical in
+  both semconv versions. Measured on a consumer's full exposition before
+  (otel v1.44.0) and after: same series names, same label names, same types;
+  the only value changes are `telemetry_sdk_version` 1.44.0 -> 1.45.0 and
+  `otel_scope_version` 0.69.0 -> 0.70.0 on the contrib-instrumented series
+  (one-time series churn).
+
+  Two tests keep this from recurring silently:
+  `TestSemconvPinMatchesSDKDefaultSchemaURL` fails when the SDK's default
+  schema URL and the pinned one diverge, and
+  `TestSetupMergesSDKDefaultResource` asserts no merge failure is logged and
+  `target_info` carries `telemetry_sdk_*`.
+
+  **Consumers on kit <= v0.3.0:** raising the v1.45.0 set in the consumer's
+  own go.mod is enough to clear GO-2026-6505, but it is not free. Until the
+  consumer adopts the kit release that carries this change it logs the WARN
+  above at every start and its `target_info` lacks `telemetry_sdk_*`.
 
 ## [0.3.0] - 2026-09-26
 
