@@ -146,8 +146,20 @@ import (
 
 	// SEMCONV PIN. This is the ONE semconv import site in the kit. Bumping the
 	// version here is the whole migration; do not import semconv elsewhere.
-	semconv "go.opentelemetry.io/otel/semconv/v1.41.0"
+	//
+	// It is NOT free to lag the SDK: the version must be the one otel/sdk's
+	// default resource is built on (v1.45.0 -> semconv v1.43.0), or the
+	// resource merge in buildResource fails. See semconvSchemaURL below.
+	semconv "go.opentelemetry.io/otel/semconv/v1.43.0"
 )
+
+// semconvSchemaURL is the schema URL of the pinned semconv version, stamped on
+// the service's own resource. It MUST equal the schema URL of the SDK's default
+// resource (resource.Default), or resource.Merge refuses the pair and
+// buildResource falls back to the explicit attributes -- losing telemetry_sdk_*
+// on target_info and on every span. TestSemconvPinMatchesSDKDefaultSchemaURL
+// fails when an OpenTelemetry bump makes the two diverge.
+const semconvSchemaURL = semconv.SchemaURL
 
 // ScopeName is the instrumentation scope for the kit's own telemetry.
 const ScopeName = "github.com/leftathome/go-service-kit/obs"
@@ -389,7 +401,7 @@ func buildResource(_ context.Context, logger *slog.Logger, name string, cfg Conf
 	if cfg.Environment != "" {
 		attrs = append(attrs, semconv.DeploymentEnvironmentNameKey.String(cfg.Environment))
 	}
-	own := resource.NewWithAttributes(semconv.SchemaURL, attrs...)
+	own := resource.NewWithAttributes(semconvSchemaURL, attrs...)
 
 	merged, err := resource.Merge(resource.Default(), own)
 	if err != nil {
