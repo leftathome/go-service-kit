@@ -69,7 +69,10 @@
 #     or 129.
 #   - The command runs in the background of this script (so that a signal is
 #     acted on at once instead of when the attempt ends), which means its
-#     stdin is /dev/null. A download step has nothing to read.
+#     stdin is /dev/null. A download step has nothing to read. It also means
+#     that without coreutils timeout(1) on PATH (stock macOS) an interrupt can
+#     leave processes the command started running briefly: they inherit
+#     SIGINT ignored, and the trap signals only the command itself.
 #   - busybox timeout only: it reports a kill with the command's own exit
 #     status, so the clock is the only evidence, in whole seconds. A command
 #     that finishes by itself in the very second its limit expires is taken
