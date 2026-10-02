@@ -6,6 +6,26 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- **The Go gates retry their downloads, never their verdict** (quark-q5a).
+  `make lint` and `make vulncheck` ran `go run <tool>@<version>`, which
+  fetches from proxy.golang.org inside the command whose exit status is the
+  verdict; a transient proxy failure ("net/http: TLS handshake timeout")
+  read as a red gate and needed a manual retry (!3, job 26677). They now
+  `go install` the pinned tool into `bin/tools`, and `test`, `lint` and
+  `vulncheck` fetch the module graph (`make mod-download`), through
+  `scripts/retry.sh` -- 4 attempts, 10s/30s/90s waits, 600s per attempt,
+  1200s in total -- and then run the tool once, unwrapped. Only a failure
+  that looks like a failed fetch is retried; anything else fails at once. A
+  lint finding, a failing test or a real vulnerability still fails on the
+  first run. The install is skipped when `bin/tools` already holds the pinned
+  version built with the toolchain in use, so the gates run offline once the
+  tools are there. `scripts/retry_test.go` tests the helper and drives the
+  Makefile with a fake toolchain to hold that line; `.golangci.yml` excludes
+  gosec for that one file. Tooling only: no package of the library
+  changes, and `scripts` holds tests, nothing importable.
+
 ### Security
 
 - **OpenTelemetry bumped past GO-2026-6505** (CVE-2026-81870,

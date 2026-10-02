@@ -8,6 +8,17 @@ linters:
     - gosec
     - misspell
     - revive
+  exclusions:
+    rules:
+      # scripts/retry_test.go is a test harness: it writes executable fixtures
+      # and runs make and sh on them, which is all gosec would report there. A
+      # path rule rather than a nolint directive per call, because a directive
+      # is re-read from the file's ABSOLUTE path when golangci-lint replays a
+      # cached result, and the copy `make e2e` lints lives in a temp directory
+      # that is gone by the next run.
+      - path: scripts/retry_test\.go
+        linters:
+          - gosec
 formatters:
   enable:
     - gofumpt
