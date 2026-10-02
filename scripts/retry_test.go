@@ -17,6 +17,20 @@
 //
 // Unix only: everything here drives sh and make, and the signal tests need
 // kill(2).
+//
+// NO TEST HERE MAY DEPEND ON HOW FAST THE MACHINE IS. These tests run on CI
+// nodes where starting a process can take seconds, twice at once in the
+// template (its own copy and the generated project's). So:
+//   - nothing has to FINISH within a limit: an attempt that is meant to be
+//     killed never ends by itself, and one that is meant to end by itself runs
+//     under a limit of minutes;
+//   - what is asserted is what happened (log lines, exit status, attempt
+//     count, which process is alive), not how long it took;
+//   - where "promptly" is the property, the bound is far below what a wrong
+//     implementation would take (stopBound against a 600s sleep), and far
+//     above what a loaded machine needs;
+//   - the one rule that is about the clock itself is tested with a fake
+//     date(1), not by racing the real one.
 
 //go:build unix
 
@@ -30,6 +44,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"syscall"
 	"testing"
@@ -43,26 +58,26 @@ const fetchFailure = `go: golang.org/x/vuln/cmd/govulncheck@v1.6.0: Get "https:/
 // flaky is a command that fails with status $2 until it has been run more
 // than $1 times, counting its runs in ./runs. A failing run prints $FLAKY_MSG
 // (default: a fetch failure) to stderr -- unless a third argument says how to
-// overstay instead: "hang" sleeps, "stubborn" sleeps ignoring SIGTERM, "polite"
-// sleeps and exits 0 when it gets SIGTERM, "chatty" writes a line to stderr and
-// its pid to ./pid and then sleeps. "edge" is the one mode that does not
-// overstay: it fails by itself just as the wall clock enters the second in
-// which a 2s limit would expire (or, started too early in a second for that to
-// be safely before the limit, records ./inconclusive and exits 0).
+// overstay instead, in which case it never ends by itself (600s, far beyond
+// any limit a test sets): "hang" sleeps, "stubborn" sleeps ignoring SIGTERM,
+// "polite" creates ./ready once it is prepared to exit 0 on SIGTERM and then
+// sleeps, "chatty" writes a line to stderr and its pid to ./pid and then
+// sleeps.
 const flaky = `#!/bin/sh
 echo run >>runs
 n=$(wc -l <runs)
 [ "$n" -gt "$1" ] && exit 0
 case "${3:-}" in
-hang) exec sleep 60 ;;
+hang) exec sleep 600 ;;
 stubborn)
 	trap '' TERM
-	exec sleep 60
+	exec sleep 600
 	;;
 polite)
 	trap 'exit 0' TERM
+	: >ready
 	i=0
-	while [ "$i" -lt 600 ]; do
+	while [ "$i" -lt 6000 ]; do
 		sleep 0.1
 		i=$((i + 1))
 	done
@@ -70,20 +85,7 @@ polite)
 chatty)
 	echo "flaky: partial progress" >&2
 	echo $$ >pid
-	exec sleep 60
-	;;
-edge)
-	s=$(date +%s)
-	case "$(date +%N)" in
-	[3-9][0-9]*) ;;
-	*)
-		echo early >inconclusive
-		exit 0
-		;;
-	esac
-	while [ "$(date +%s)" -lt $((s + 2)) ]; do
-		sleep 0.05
-	done
+	exec sleep 600
 	;;
 esac
 echo "${FLAKY_MSG:-$FLAKY_DEFAULT_MSG}" >&2
@@ -176,7 +178,9 @@ exit "$rc"
 
 // passThroughTimeout is a timeout(1) of the kind that reports the COMMAND's
 // exit status when it kills it (busybox with -k behaves so): no --foreground,
-// SIGTERM at the limit, and whatever the command then exits with.
+// SIGTERM at the limit, and whatever the command then exits with. It does not
+// send the signal before ./ready exists, so that the command it kills is
+// certain to have got as far as it needs to, however slow the machine.
 const passThroughTimeout = `#!/bin/sh
 [ "$1" = --foreground ] && exit 1
 [ "$1" = -k ] && shift 2
@@ -186,10 +190,39 @@ shift
 pid=$!
 (
 	sleep "$secs"
+	while [ ! -e ready ]; do sleep 0.1; done
 	kill -TERM "$pid" 2>/dev/null
 ) >/dev/null 2>&1 &
 wait "$pid"
 `
+
+// untimedTimeout takes coreutils timeout's arguments and enforces nothing: the
+// command runs to its own end and its status is passed on. retry.sh takes it
+// for coreutils (it accepts --foreground), and no real timer can fire.
+const untimedTimeout = `#!/bin/sh
+[ "$1" = --foreground ] && shift
+[ "$1" = -k ] && shift 2
+shift
+exec "$@"
+`
+
+// fakeClock is a date(1) whose every reading is 1000 seconds after the last
+// one, kept in $CLOCK. By this clock everything takes longer than any limit.
+const fakeClock = `#!/bin/sh
+n=$(cat "$CLOCK" 2>/dev/null || echo 0)
+n=$((n + 1000))
+echo "$n" >"$CLOCK"
+echo "$n"
+`
+
+// stopBound is how long something that must happen "at once" may take. The
+// alternative it is told apart from is always a 600s sleep; a loaded CI node
+// needs seconds.
+const stopBound = 2 * time.Minute
+
+// safetyNet bounds a run that should simply end: a hang fails the test with
+// its output instead of timing the whole package out.
+const safetyNet = 5 * time.Minute
 
 func needShell(t *testing.T) {
 	t.Helper()
@@ -258,10 +291,49 @@ func exitCode(t *testing.T, err error) int {
 	return ee.ExitCode()
 }
 
-// runRetry runs retry.sh in a fresh directory holding the flaky command, with
-// env added to the environment, and returns its exit status, its combined
-// output and that directory.
-func runRetry(t *testing.T, env []string, args ...string) (code int, out, dir string) {
+// start starts cmd in a process group of its own, with stdout and stderr going
+// to the file it returns the path of -- a file, not a pipe, so that a process
+// left behind cannot keep a reader waiting. Whatever is still in the group
+// when the test ends is killed.
+func start(t *testing.T, cmd *exec.Cmd) (outPath string) {
+	t.Helper()
+	outPath = filepath.Join(t.TempDir(), "output")
+	f, err := os.Create(outPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cmd.Stdout, cmd.Stderr = f, f
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	_ = f.Close() // the child has its own descriptors
+	t.Cleanup(func() { _ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL) })
+	return outPath
+}
+
+// waitWithin waits for a started cmd and returns its exit status, or fails the
+// test if it has not ended within bound (and kills its process group).
+func waitWithin(t *testing.T, cmd *exec.Cmd, bound time.Duration, outPath string) int {
+	t.Helper()
+	done := make(chan error, 1)
+	go func() { done <- cmd.Wait() }()
+	select {
+	case err := <-done:
+		return exitCode(t, err)
+	case <-time.After(bound):
+		_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+		<-done
+		t.Fatalf("still running after %s:\n%s", bound, strings.Join(lines(t, outPath), "\n"))
+		return -1
+	}
+}
+
+// runRetryWithin runs retry.sh in a fresh directory holding the flaky command,
+// with env added to the environment, and returns its exit status, its combined
+// output and that directory. It fails the test if the run takes longer than
+// bound.
+func runRetryWithin(t *testing.T, bound time.Duration, env []string, args ...string) (code int, out, dir string) {
 	t.Helper()
 	needShell(t)
 	dir = t.TempDir()
@@ -273,8 +345,19 @@ func runRetry(t *testing.T, env []string, args ...string) (code int, out, dir st
 		"RETRY_ATTEMPTS=", "RETRY_DELAY=", "RETRY_ATTEMPT_TIMEOUT=", "RETRY_BUDGET=", "RETRY_PATTERN=",
 		"FLAKY_MSG=", "FLAKY_DEFAULT_MSG="+fetchFailure)
 	cmd.Env = append(cmd.Env, env...)
-	raw, err := cmd.CombinedOutput()
-	return exitCode(t, err), string(raw), dir
+	outPath := start(t, cmd)
+	code = waitWithin(t, cmd, bound, outPath)
+	raw, err := os.ReadFile(outPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return code, string(raw), dir
+}
+
+// runRetry is runRetryWithin for a run that should simply end.
+func runRetry(t *testing.T, env []string, args ...string) (code int, out, dir string) {
+	t.Helper()
+	return runRetryWithin(t, safetyNet, env, args...)
 }
 
 func runs(t *testing.T, dir string) int {
@@ -477,43 +560,39 @@ func TestRetryKeepsStdoutApartFromStderr(t *testing.T) {
 }
 
 // With coreutils timeout a kill is reported, so an attempt that fails by
-// itself -- however late, even in the second its limit runs out -- is an
-// ordinary failure: it is not called killed, and so it is not retried on the
-// strength of having been slow.
+// itself -- however late, even after its limit by the clock -- is an ordinary
+// failure: it is not called killed, and so it is not retried on the strength
+// of having been slow.
+//
+// Late BY THE CLOCK is arranged, not raced for: date(1) is a fake that jumps
+// 1000 seconds at every reading, and timeout(1) is a fake that takes coreutils'
+// arguments and never fires. The command fails at once, on its own account,
+// and by retry.sh's arithmetic it overstayed a 600s limit.
 func TestRetryDoesNotCallASlowFailureAKill(t *testing.T) {
 	t.Parallel()
-	needShell(t)
-	if exec.CommandContext(t.Context(), "timeout", "--foreground", "-k", "1", "5", "true").Run() != nil {
-		t.Skip("needs coreutils timeout; with busybox this is the documented limit")
+	bin := t.TempDir()
+	writeFile(t, filepath.Join(bin, "date"), fakeClock, 0o700)
+	writeFile(t, filepath.Join(bin, "timeout"), untimedTimeout, 0o700)
+	code, out, dir := runRetry(t, []string{
+		"PATH=" + bin + string(os.PathListSeparator) + os.Getenv("PATH"),
+		"CLOCK=" + filepath.Join(bin, "clock"),
+		"RETRY_DELAY=0", "RETRY_ATTEMPTS=2", "RETRY_BUDGET=86400", "FLAKY_MSG=not a download problem",
+	}, "./flaky", "99", "5")
+	if code != 5 || runs(t, dir) != 1 {
+		t.Errorf("exit %d after %d runs, want the command's own 5 after 1\n%s", code, runs(t, dir), out)
 	}
-	for try := 0; try < 8; try++ {
-		// Start mid-second, so the command has room to finish before the limit.
-		time.Sleep(time.Duration((1500-time.Now().Nanosecond()/1e6)%1000) * time.Millisecond)
-		code, out, dir := runRetry(t, []string{
-			"RETRY_DELAY=0", "RETRY_ATTEMPTS=2", "RETRY_ATTEMPT_TIMEOUT=2", "FLAKY_MSG=not a download problem",
-		}, "./flaky", "99", "5", "edge")
-		// Inconclusive only if the FIRST attempt said so (it then exited 0 and
-		// there was no second). A second attempt means the first was retried,
-		// which is the failure this test exists to catch, whatever the second
-		// one went on to record.
-		if _, err := os.Stat(filepath.Join(dir, "inconclusive")); err == nil && runs(t, dir) == 1 {
-			continue // started too early in its second; try again
-		}
-		if code != 5 || runs(t, dir) != 1 {
-			t.Errorf("exit %d after %d runs, want the command's own 5 after 1\n%s", code, runs(t, dir), out)
-		}
-		if strings.Contains(out, "killed") || !strings.Contains(out, "this does not look like a failed download (exit 5)") {
-			t.Errorf("a command that failed by itself was called killed:\n%s", out)
-		}
-		return
+	if strings.Contains(out, "killed") || !strings.Contains(out, "this does not look like a failed download (exit 5)") {
+		t.Errorf("a command that failed by itself was called killed:\n%s", out)
 	}
-	t.Skip("could not start the command late enough in a second, eight times running")
 }
 
 // An interrupt is acted on at once, during an attempt and during the wait
 // between two: the attempt is stopped, the stderr captured so far is shown
 // (once), the temp directory is removed, nothing further is attempted, and the
 // exit status is the conventional 128+signal.
+//
+// "At once" means: without sitting out the attempt or the backoff, which are
+// both 600s here. The test allows stopBound.
 func TestRetryStopsAtOnceWhenInterrupted(t *testing.T) {
 	t.Parallel()
 	needShell(t)
@@ -535,52 +614,44 @@ func TestRetryStopsAtOnceWhenInterrupted(t *testing.T) {
 				tmp := filepath.Join(dir, "tmp")
 				writeFile(t, filepath.Join(tmp, ".keep"), "", 0o600)
 				writeFile(t, filepath.Join(dir, "flaky"), flaky, 0o700)
-				outPath := filepath.Join(dir, "out")
-				outFile, err := os.Create(outPath)
-				if err != nil {
-					t.Fatal(err)
-				}
-				defer func() { _ = outFile.Close() }()
 
-				mode := "chatty" // sleeps 60s with a line of stderr captured
+				mode := "chatty" // sleeps 600s with a line of stderr captured
 				if phase == "during the backoff" {
-					mode = "" // fails at once with a fetch failure; then a 60s wait
+					mode = "" // fails at once with a fetch failure; then a 600s wait
 				}
 				cmd := exec.CommandContext(t.Context(), "sh", retryScript(t), "./flaky", "99", "1", mode)
 				cmd.Dir = dir
-				cmd.Stdout, cmd.Stderr = outFile, outFile
-				cmd.Env = append(os.Environ(), "TMPDIR="+tmp, "RETRY_ATTEMPTS=3", "RETRY_DELAY=60",
+				cmd.Env = append(os.Environ(), "TMPDIR="+tmp, "RETRY_ATTEMPTS=3", "RETRY_DELAY=600",
 					"RETRY_ATTEMPT_TIMEOUT=", "RETRY_BUDGET=", "RETRY_PATTERN=", "FLAKY_MSG=", "FLAKY_DEFAULT_MSG="+fetchFailure)
-				if err := cmd.Start(); err != nil {
-					t.Fatal(err)
-				}
+				outPath := start(t, cmd)
+
+				// Wait for the state to interrupt, by what retry.sh and the
+				// command have written, for as long as it takes.
 				ready := func() bool {
 					if mode == "chatty" {
 						return len(lines(t, filepath.Join(dir, "pid"))) == 1
 					}
-					return strings.Contains(strings.Join(lines(t, outPath), "\n"), "retrying in 60s")
+					return strings.Contains(strings.Join(lines(t, outPath), "\n"), "retrying in 600s")
 				}
-				for deadline := time.Now().Add(20 * time.Second); !ready(); time.Sleep(20 * time.Millisecond) {
+				for deadline := time.Now().Add(safetyNet); !ready(); time.Sleep(20 * time.Millisecond) {
 					if time.Now().After(deadline) {
-						_ = cmd.Process.Kill()
 						t.Fatalf("retry.sh never got as far as %s:\n%s", phase, strings.Join(lines(t, outPath), "\n"))
 					}
 				}
-				time.Sleep(200 * time.Millisecond) // let it settle into the wait
+				// The command writes its pid a moment before retry.sh has noted
+				// that pid and begun to wait. A second is enough for those two
+				// shell statements; nothing below depends on the second being
+				// short.
+				time.Sleep(time.Second)
 
-				sent := time.Now()
 				if err := cmd.Process.Signal(tc.sig); err != nil {
 					t.Fatal(err)
 				}
-				code := exitCode(t, cmd.Wait())
-				took := time.Since(sent)
+				code := waitWithin(t, cmd, stopBound, outPath)
 				out := strings.Join(lines(t, outPath), "\n")
 
 				if code != tc.code {
 					t.Errorf("exit %d, want %d\n%s", code, tc.code, out)
-				}
-				if took > 5*time.Second {
-					t.Errorf("took %s to stop; an interrupt must not wait for the attempt or the backoff", took)
 				}
 				if runs(t, dir) != 1 {
 					t.Errorf("%d attempts were started, want 1\n%s", runs(t, dir), out)
@@ -601,14 +672,13 @@ func TestRetryStopsAtOnceWhenInterrupted(t *testing.T) {
 						pid = pid*10 + int(c-'0')
 					}
 					gone := false
-					for deadline := time.Now().Add(5 * time.Second); time.Now().Before(deadline); time.Sleep(20 * time.Millisecond) {
+					for deadline := time.Now().Add(stopBound); time.Now().Before(deadline); time.Sleep(20 * time.Millisecond) {
 						if errors.Is(syscall.Kill(pid, 0), syscall.ESRCH) {
 							gone = true
 							break
 						}
 					}
 					if !gone {
-						_ = syscall.Kill(pid, syscall.SIGKILL)
 						t.Errorf("the attempt (pid %d) was left running", pid)
 					}
 				} else if strings.Count(out, fetchFailure) != 1 {
@@ -655,27 +725,38 @@ func timeoutFlavors(t *testing.T) map[string]string {
 // An attempt that overstays its limit is killed and counted as a failed
 // fetch, whatever it does about the signal: it is retried, it is never
 // reported as a success, and the log says it was killed.
+//
+// The command never ends by itself, on any attempt, so nothing here has to
+// beat the 1s limit: the assertions are on the two log lines and the status.
+// (A machine too slow to get the command as far as its trap within the second
+// still kills it, and the test still passes; it only exercises less.)
 func TestRetryKillsAnAttemptThatOverstays(t *testing.T) {
 	t.Parallel()
 	for flavor, path := range timeoutFlavors(t) {
-		for mode, wantRuns := range map[string]int{
-			"hang":     2, // dies on SIGTERM; the second attempt succeeds
+		for mode, attempts := range map[string]int{
+			"hang":     2, // dies on SIGTERM
 			"polite":   2, // exits 0 on SIGTERM: still a failure, still retried
-			"stubborn": 2, // ignores SIGTERM: SIGKILL follows
+			"stubborn": 1, // ignores SIGTERM: SIGKILL follows, 10s later
 		} {
 			t.Run(flavor+"/"+mode, func(t *testing.T) {
 				t.Parallel()
-				start := time.Now()
-				code, out, dir := runRetry(t, []string{"PATH=" + path, "RETRY_DELAY=0", "RETRY_ATTEMPT_TIMEOUT=2"},
-					"./flaky", "1", "1", mode)
-				if code != 0 || runs(t, dir) != wantRuns {
-					t.Fatalf("exit %d after %d runs, want 0 after %d\n%s", code, runs(t, dir), wantRuns, out)
+				// stopBound: without the SIGKILL, "stubborn" would sleep out
+				// its 600s.
+				code, out, _ := runRetryWithin(t, stopBound, []string{
+					"PATH=" + path, "RETRY_DELAY=0", "RETRY_ATTEMPT_TIMEOUT=1", "RETRY_ATTEMPTS=" + strconv.Itoa(attempts),
+				}, "./flaky", "99", "1", mode)
+				if code == 0 {
+					t.Errorf("exit 0 although every attempt was killed\n%s", out)
 				}
-				if !regexp.MustCompile(`attempt 1/4 failed \(killed after 2s, exit [1-9][0-9]*\)`).MatchString(out) {
-					t.Errorf("the overstaying attempt was not reported as killed with a failing status:\n%s", out)
+				killed := `\(killed after 1s, exit [1-9][0-9]*\)`
+				want := []string{`giving up after ` + strconv.Itoa(attempts) + `/` + strconv.Itoa(attempts) + ` attempts ` + killed}
+				if attempts == 2 {
+					want = append(want, `attempt 1/2 failed `+killed+`, retrying in 0s`)
 				}
-				if d := time.Since(start); d > 40*time.Second {
-					t.Errorf("took %s; the 60s sleep was not cut short", d)
+				for _, w := range want {
+					if !regexp.MustCompile(w).MatchString(out) {
+						t.Errorf("no line matching %q: the overstaying attempt was not reported as killed with a failing status, or not retried:\n%s", w, out)
+					}
 				}
 			})
 		}
@@ -683,7 +764,9 @@ func TestRetryKillsAnAttemptThatOverstays(t *testing.T) {
 }
 
 // A killed LAST attempt must fail the step even if the command exited 0 on
-// its way out.
+// its way out. The third timeout here is the one that makes that happen for
+// certain: it passes the command's own status on, and it does not send the
+// signal until the command is ready to answer it with exit 0.
 func TestRetryNeverReportsAKilledAttemptAsSuccess(t *testing.T) {
 	t.Parallel()
 	flavors := timeoutFlavors(t)
@@ -693,12 +776,12 @@ func TestRetryNeverReportsAKilledAttemptAsSuccess(t *testing.T) {
 	for flavor, path := range flavors {
 		t.Run(flavor, func(t *testing.T) {
 			t.Parallel()
-			code, out, dir := runRetry(t, []string{"PATH=" + path, "RETRY_ATTEMPTS=1", "RETRY_ATTEMPT_TIMEOUT=1"},
+			code, out, _ := runRetryWithin(t, stopBound, []string{"PATH=" + path, "RETRY_ATTEMPTS=1", "RETRY_ATTEMPT_TIMEOUT=1"},
 				"./flaky", "99", "1", "polite")
-			if code == 0 || runs(t, dir) != 1 {
-				t.Errorf("exit %d after %d runs, want a failure after 1\n%s", code, runs(t, dir), out)
+			if code == 0 {
+				t.Errorf("exit 0 from a killed attempt\n%s", out)
 			}
-			if !strings.Contains(out, "giving up after 1/1 attempts (killed after 1s, exit") {
+			if !regexp.MustCompile(`giving up after 1/1 attempts \(killed after 1s, exit [1-9][0-9]*\)`).MatchString(out) {
 				t.Errorf("missing the killed line in:\n%s", out)
 			}
 		})
@@ -719,14 +802,16 @@ func TestRetryReportsACommandsOwn124AsAnExit(t *testing.T) {
 }
 
 // The budget bounds the whole thing: a wait that would overrun it is not
-// started, and the status is still the command's own.
+// started, and the status is still the command's own. The wait (an hour) is
+// longer than the whole budget (100s), so it overruns however little of the
+// budget the first attempt used -- and the attempt itself has all 100s.
 func TestRetryStopsAtTheBudget(t *testing.T) {
 	t.Parallel()
-	code, out, dir := runRetry(t, []string{"RETRY_DELAY=5", "RETRY_BUDGET=2"}, "./flaky", "99", "9")
+	code, out, dir := runRetry(t, []string{"RETRY_DELAY=3600", "RETRY_BUDGET=100"}, "./flaky", "99", "9")
 	if code != 9 || runs(t, dir) != 1 {
 		t.Fatalf("exit %d after %d runs, want 9 after 1\n%s", code, runs(t, dir), out)
 	}
-	if !strings.Contains(out, "would overrun the 2s budget") {
+	if !strings.Contains(out, "giving up after attempt 1/4 (exit 9), a 3600s wait would overrun the 100s budget") {
 		t.Errorf("missing the budget line in:\n%s", out)
 	}
 }
