@@ -180,7 +180,10 @@ exit "$rc"
 // exit status when it kills it (busybox with -k behaves so): no --foreground,
 // SIGTERM at the limit, and whatever the command then exits with. It does not
 // send the signal before ./ready exists, so that the command it kills is
-// certain to have got as far as it needs to, however slow the machine.
+// certain to have got as far as it needs to, however slow the machine. Once
+// the command has ended the watcher is stopped: left alone it would signal,
+// seconds later, a pid that by then may be some other process's (retry.sh
+// probes its timeout with `true`, which is gone at once).
 const passThroughTimeout = `#!/bin/sh
 [ "$1" = --foreground ] && exit 1
 [ "$1" = -k ] && shift 2
@@ -193,7 +196,11 @@ pid=$!
 	while [ ! -e ready ]; do sleep 0.1; done
 	kill -TERM "$pid" 2>/dev/null
 ) >/dev/null 2>&1 &
+watcher=$!
 wait "$pid"
+rc=$?
+kill "$watcher" 2>/dev/null
+exit "$rc"
 `
 
 // untimedTimeout takes coreutils timeout's arguments and enforces nothing: the
@@ -327,6 +334,22 @@ func waitWithin(t *testing.T, cmd *exec.Cmd, bound time.Duration, outPath string
 		t.Fatalf("still running after %s:\n%s", bound, strings.Join(lines(t, outPath), "\n"))
 		return -1
 	}
+}
+
+// asleep reports whether process pid is blocked in the kernel (state S in
+// /proc/<pid>/stat), which for a shell with a job in the background means it
+// has reached its `wait`. known is false where there is no /proc to ask.
+func asleep(pid int) (blocked, known bool) {
+	raw, err := os.ReadFile("/proc/" + strconv.Itoa(pid) + "/stat")
+	if err != nil {
+		return false, false
+	}
+	// "pid (comm) S ...": the state follows the last ")".
+	i := bytes.LastIndexByte(raw, ')')
+	if i < 0 || i+2 >= len(raw) {
+		return false, false
+	}
+	return raw[i+2] == 'S', true
 }
 
 // runRetryWithin runs retry.sh in a fresh directory holding the flaky command,
@@ -638,11 +661,24 @@ func TestRetryStopsAtOnceWhenInterrupted(t *testing.T) {
 						t.Fatalf("retry.sh never got as far as %s:\n%s", phase, strings.Join(lines(t, outPath), "\n"))
 					}
 				}
-				// The command writes its pid a moment before retry.sh has noted
-				// that pid and begun to wait. A second is enough for those two
-				// shell statements; nothing below depends on the second being
-				// short.
-				time.Sleep(time.Second)
+				// What ready saw is written a statement or two before retry.sh
+				// has noted which process to stop and begun to wait for it, and
+				// that wait is the first thing it can block on from there. So
+				// wait until it is blocked, where the kernel will say; elsewhere
+				// a second is ample for two assignments.
+				for deadline := time.Now().Add(safetyNet); ; time.Sleep(20 * time.Millisecond) {
+					blocked, known := asleep(cmd.Process.Pid)
+					if !known {
+						time.Sleep(time.Second)
+						break
+					}
+					if blocked {
+						break
+					}
+					if time.Now().After(deadline) {
+						t.Fatalf("retry.sh never settled into its wait %s:\n%s", phase, strings.Join(lines(t, outPath), "\n"))
+					}
+				}
 
 				if err := cmd.Process.Signal(tc.sig); err != nil {
 					t.Fatal(err)
@@ -802,17 +838,29 @@ func TestRetryReportsACommandsOwn124AsAnExit(t *testing.T) {
 }
 
 // The budget bounds the whole thing: a wait that would overrun it is not
-// started, and the status is still the command's own. The wait (an hour) is
-// longer than the whole budget (100s), so it overruns however little of the
-// budget the first attempt used -- and the attempt itself has all 100s.
+// started, and the status is still the command's own. The wait is as long as
+// the whole budget (an hour each), so it overruns however little of the budget
+// the first attempt used -- and the attempt itself has its full ten minutes.
+// sleep(1) is a fake, so that a retry.sh which did start the wait is caught by
+// its second attempt and not by an hour's sleep.
 func TestRetryStopsAtTheBudget(t *testing.T) {
 	t.Parallel()
-	code, out, dir := runRetry(t, []string{"RETRY_DELAY=3600", "RETRY_BUDGET=100"}, "./flaky", "99", "9")
+	bin := t.TempDir()
+	writeFile(t, filepath.Join(bin, "sleep"), fakeSleep, 0o700)
+	sleepLog := filepath.Join(bin, "sleep.log")
+	code, out, dir := runRetry(t, []string{
+		"PATH=" + bin + string(os.PathListSeparator) + os.Getenv("PATH"),
+		"SLEEP_LOG=" + sleepLog,
+		"RETRY_DELAY=3600", "RETRY_BUDGET=3600",
+	}, "./flaky", "99", "9")
 	if code != 9 || runs(t, dir) != 1 {
 		t.Fatalf("exit %d after %d runs, want 9 after 1\n%s", code, runs(t, dir), out)
 	}
-	if !strings.Contains(out, "giving up after attempt 1/4 (exit 9), a 3600s wait would overrun the 100s budget") {
+	if !strings.Contains(out, "giving up after attempt 1/4 (exit 9), a 3600s wait would overrun the 3600s budget") {
 		t.Errorf("missing the budget line in:\n%s", out)
+	}
+	if slept := lines(t, sleepLog); len(slept) != 0 {
+		t.Errorf("slept %v, want no wait at all\n%s", slept, out)
 	}
 }
 

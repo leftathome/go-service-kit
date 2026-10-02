@@ -32,12 +32,14 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   (quark-f9t). On a loaded CI node two of its tests failed with nothing wrong
   (go-service-template main pipeline #3116): one gave a command two seconds
   to fail by itself, the other allowed five seconds for an interrupt to be
-  handled. Now no test has to finish inside a limit. A command that is meant
-  to be killed never ends by itself; the one rule that is about the clock is
-  tested with a fake `date`; "stops at once" means within two minutes against
-  an alternative of ten; and what is asserted is what happened (log lines,
-  exit status, which process is alive), not how long it took. Tests only:
-  `scripts/retry.sh` and the Makefile are unchanged.
+  handled. Three more had the same kind of margin and had not failed yet.
+  Now no test has to finish inside a limit. A command that is meant to be
+  killed never ends by itself; the one rule that is about the clock is tested
+  with a fake `date`; the interrupt is sent once retry.sh is seen to be
+  blocked in its wait, not after a pause; "stops at once" means within two
+  minutes against an alternative of ten; and what is asserted is what
+  happened (log lines, exit status, which process is alive), not how long it
+  took. Tests only: `scripts/retry.sh` and the Makefile are unchanged.
 
 ### Security
 
